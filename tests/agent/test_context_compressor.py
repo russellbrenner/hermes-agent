@@ -400,3 +400,57 @@ class TestPruneToolOutputs:
 
         assert pruned[-2]["content"] == huge_content
         assert pruned[-1]["content"] == "latest"
+
+
+class TestPruneAcceptancePolicy:
+    def _make_compressor(self, *, context_length=128000):
+        with patch("agent.context_compressor.get_model_context_length", return_value=context_length):
+            return ContextCompressor(
+                model="test/model",
+                threshold_percent=0.50,
+                protect_first_n=2,
+                protect_last_n=1,
+                quiet_mode=True,
+            )
+
+    def test_prune_near_threshold_still_falls_back_to_summary(self):
+        c = self._make_compressor()
+        huge_content = "x" * 180000
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "older"},
+            {"role": "tool", "content": huge_content, "name": "terminal"},
+            {"role": "assistant", "content": "newer"},
+            {"role": "tool", "content": huge_content, "name": "terminal"},
+            {"role": "assistant", "content": "tail"},
+        ]
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: compacted"
+
+        with patch("agent.context_compressor.estimate_messages_tokens_rough", return_value=62000), \
+             patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(messages, current_tokens=68000)
+
+        assert any("CONTEXT SUMMARY" in (msg.get("content") or "") for msg in result)
+
+    def test_prune_only_is_allowed_when_it_buys_real_runway(self):
+        c = self._make_compressor()
+        huge_content = "x" * 180000
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "older"},
+            {"role": "tool", "content": huge_content, "name": "terminal"},
+            {"role": "assistant", "content": "newer"},
+            {"role": "tool", "content": huge_content, "name": "terminal"},
+            {"role": "assistant", "content": "tail"},
+        ]
+
+        with patch("agent.context_compressor.estimate_messages_tokens_rough", return_value=48000), \
+             patch.object(ContextCompressor, "_generate_summary", side_effect=AssertionError("summary should not be called")):
+            result = c.compress(messages, current_tokens=68000)
+
+        assert result[3]["content"].startswith("[Tool output pruned")
+        assert result[5]["content"] == huge_content

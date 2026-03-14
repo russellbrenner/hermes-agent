@@ -74,6 +74,8 @@ class ContextCompressor:
         self.summary_model = summary_model_override or ""
         self._prune_protect_tokens = _adaptive_prune_protect(self.context_length)
         self._prune_minimum_tokens = _adaptive_prune_minimum(self.context_length)
+        self._prune_runway_tokens = max(self._prune_minimum_tokens, int(self.threshold_tokens * 0.15))
+        self._prune_target_tokens = max(0, self.threshold_tokens - self._prune_runway_tokens)
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
@@ -354,7 +356,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                     f"   ✂️  Phase 1 (prune): removed {chars_saved:,} chars of old tool outputs "
                     f"(~{tokens_saved_phase1:,} tokens saved)"
                 )
-            if pruned_tokens < self.threshold_tokens:
+            if pruned_tokens <= self._prune_target_tokens:
                 self.compression_count += 1
                 pruned_messages = self._sanitize_tool_pairs(pruned_messages)
                 if not self.quiet_mode:
@@ -364,6 +366,11 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                     )
                     print(f"   💡 Compression #{self.compression_count} complete (prune only — no LLM call needed)")
                 return pruned_messages
+            if not self.quiet_mode and pruned_tokens < self.threshold_tokens:
+                print(
+                    f"   ↪️  Phase 1 recovered tokens but not enough runway "
+                    f"({pruned_tokens:,} > target {self._prune_target_tokens:,}); continuing to compaction"
+                )
             messages = pruned_messages
             n_messages = len(messages)
             compress_start = self.protect_first_n
