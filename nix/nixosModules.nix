@@ -578,19 +578,17 @@
           mkdir -p ${cfg.stateDir}/.hermes
           mkdir -p ${cfg.stateDir}/home
           mkdir -p ${cfg.workingDirectory}
-          for _subdir in cron sessions logs memories; do
-            mkdir -p "${cfg.stateDir}/.hermes/$_subdir"
-          done
           chown ${cfg.user}:${cfg.group} ${cfg.stateDir} ${cfg.stateDir}/.hermes ${cfg.stateDir}/home ${cfg.workingDirectory}
           chmod 2770 ${cfg.stateDir} ${cfg.stateDir}/.hermes ${cfg.workingDirectory}
           chmod 0750 ${cfg.stateDir}/home
 
-          # Set subdirs to setgid + group-writable, migrate existing files.
+          # Create subdirs, set setgid + group-writable, migrate existing files.
           # Nix-managed files (config.yaml, .env, .managed) stay 0640/0644.
           find ${cfg.stateDir}/.hermes -maxdepth 1 \
             \( -name "*.db" -o -name "*.db-wal" -o -name "*.db-shm" -o -name "SOUL.md" \) \
             -exec chmod g+rw {} + 2>/dev/null || true
           for _subdir in cron sessions logs memories; do
+            mkdir -p "${cfg.stateDir}/.hermes/$_subdir"
             chown ${cfg.user}:${cfg.group} "${cfg.stateDir}/.hermes/$_subdir"
             chmod 2770 "${cfg.stateDir}/.hermes/$_subdir"
             find "${cfg.stateDir}/.hermes/$_subdir" -type f \
