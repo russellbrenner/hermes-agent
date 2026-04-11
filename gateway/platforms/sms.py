@@ -34,7 +34,6 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
-    is_network_accessible,
 )
 
 logger = logging.getLogger(__name__)
@@ -119,7 +118,7 @@ class SmsAdapter(BasePlatformAdapter):
             )
             return False
 
-        if insecure_no_sig:
+        if insecure_no_sig and not self._webhook_url:
             logger.warning(
                 "[sms] SMS_INSECURE_NO_SIGNATURE=true — Twilio signature validation "
                 "is DISABLED. Any client that can reach port %d can inject messages. "
