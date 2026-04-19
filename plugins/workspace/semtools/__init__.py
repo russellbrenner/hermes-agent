@@ -96,11 +96,69 @@ class SemtoolsIndexer(BaseIndexer):
 
     def status(self) -> dict:
         installed = shutil.which("semtools") is not None
-        return {
+        info: dict = {
             "backend": "semtools",
             "installed": installed,
             "workspace_name": self._workspace,
         }
+        if not installed:
+            return info
+        try:
+            result = subprocess.run(
+                ["semtools", "workspace", "status", "--json", self._workspace],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            ws_info = json.loads(result.stdout)
+            info["root_dir"] = ws_info.get("root_dir")
+            info["total_documents"] = ws_info.get("total_documents", 0)
+        except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+            log.debug("semtools workspace status failed: %s", e)
+        return info
+
+    def list_files(self) -> list[dict]:
+        """List files discoverable under configured roots.
+
+        Semtools auto-indexes on search, so this returns the discovery set
+        that WOULD be indexed rather than what's actually in the embedding store.
+        """
+        from workspace.files import discover_workspace_files
+
+        discovery = discover_workspace_files(self._config)
+        return [
+            {
+                "path": str(p),
+                "root": str(root),
+                "size_bytes": p.stat().st_size if p.exists() else 0,
+                "chunks": 0,
+                "modified": "",
+                "indexed": "",
+            }
+            for root, p in discovery.files
+        ]
+
+    def delete(self, path: str) -> bool:
+        """Semtools doesn't expose per-file delete; runs workspace prune instead.
+
+        Prune removes stale entries (files that no longer exist on disk).
+        Returns True if the file is gone from disk AND prune succeeded.
+        """
+        from pathlib import Path
+
+        if Path(path).exists():
+            return False
+        try:
+            subprocess.run(
+                ["semtools", "workspace", "prune", self._workspace],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return True
+        except subprocess.CalledProcessError as e:
+            log.warning("semtools workspace prune failed: %s", e.stderr)
+            return False
 
     def _ensure_semtools(self) -> None:
         """Install semtools if not already present (idempotent)."""
