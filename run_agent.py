@@ -8275,28 +8275,34 @@ class AIAgent:
                                 self._response_was_previewed = True
                                 break
                             
-                            # No fallback -- if reasoning_text exists, the model put its
-                            # entire response inside <think> tags; use that as the content.
+                            # No fallback -- the model kept emitting <think>...</think>
+                            # with empty content for 3 retries.  Preserve token IDs from
+                            # the last API attempt (reasoning-only generation) so RL can
+                            # train on this trajectory instead of dropping it entirely.
+                            # Using _build_assistant_message ensures prompt_token_ids,
+                            # generation_token_ids, and generation_log_probs are attached
+                            # when present on the assistant_message object.
                             if reasoning_text:
                                 self._vprint(f"{self.log_prefix}Using reasoning as response content (model wrapped entire response in think tags).", force=True)
                                 final_response = reasoning_text
-                                empty_msg = {
+
+                            # Preserve token IDs from the last API attempt by building the
+                            # assistant message from the live API response object.  This
+                            # avoids the all-empty-output-items ValueError in NeMo RL's
+                            # nemo_gym postprocessor when every turn was reasoning-only.
+                            try:
+                                _last_msg = self._build_assistant_message(assistant_message, finish_reason)
+                                messages.append(_last_msg)
+                            except Exception:
+                                # If assistant_message is out of scope or _build fails,
+                                # fall back to a message without token IDs (matches
+                                # original behavior).
+                                messages.append({
                                     "role": "assistant",
                                     "content": final_response,
                                     "reasoning": reasoning_text,
                                     "finish_reason": finish_reason,
-                                }
-                                messages.append(empty_msg)
-                                break
-
-                            # Truly empty -- no reasoning and no content
-                            empty_msg = {
-                                "role": "assistant",
-                                "content": final_response,
-                                "reasoning": reasoning_text,
-                                "finish_reason": finish_reason,
-                            }
-                            messages.append(empty_msg)
+                                })
 
                             self._cleanup_task_resources(effective_task_id)
                             self._persist_session(messages, conversation_history)
