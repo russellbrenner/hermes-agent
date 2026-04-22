@@ -283,8 +283,24 @@ slack:
 ```
 
 :::info
-Slack supports both patterns: `@mention` required to start a conversation by default, but you can opt specific channels out via `SLACK_FREE_RESPONSE_CHANNELS` (comma-separated channel IDs) or `slack.free_response_channels` in `config.yaml`. Once the bot has an active session in a thread, subsequent thread replies do not require a mention. In DMs the bot always responds without needing a mention.
+Slack supports both patterns: `@mention` required to start a conversation by default, but you can opt specific channels out via `SLACK_FREE_RESPONSE_CHANNELS` (comma-separated channel IDs) or `slack.free_response_channels` in `config.yaml`. Conversely, you can force specific channels to always require `@mention` — even when `require_mention` is globally `false` — with `SLACK_REQUIRE_MENTION_CHANNELS` or `slack.require_mention_channels`. Once the bot has an active session in a thread, subsequent thread replies do not require a mention. In DMs the bot always responds without needing a mention.
 :::
+
+#### Channel-Level Mention Overrides
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SLACK_FREE_RESPONSE_CHANNELS` | _(none)_ | Comma-separated channel IDs where the bot responds without `@mention`, even when `require_mention` is `true`. |
+| `SLACK_REQUIRE_MENTION_CHANNELS` | _(none)_ | Comma-separated channel IDs where the bot **always** requires `@mention`, even when `require_mention` is `false`. The inverse of free_response_channels. |
+
+In `config.yaml`:
+
+```yaml
+slack:
+  require_mention: true
+  free_response_channels: "C01CHANNEL1,C02CHANNEL2"
+  require_mention_channels: "C03CHANNEL3,C04CHANNEL4"
+```
 
 ### Unauthorized User Handling
 
@@ -324,6 +340,7 @@ stt_enabled: true
 # Slack-specific settings
 slack:
   require_mention: true
+  require_mention_channels: []    # Channel IDs that always require @mention
   unauthorized_dm_behavior: "pair"
 
 # Platform config

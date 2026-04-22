@@ -61,6 +61,8 @@ matrix:
   require_mention: true           # Require @mention in rooms (default: true)
   free_response_rooms:            # Rooms exempt from mention requirement
     - "!abc123:matrix.org"
+  require_mention_rooms:          # Rooms that always require @mention
+    - "!locked789:matrix.org"
   auto_thread: true               # Auto-create threads for responses (default: true)
   dm_mention_threads: false       # Create thread when @mentioned in DM (default: false)
 ```
@@ -70,6 +72,7 @@ Or via environment variables:
 ```bash
 MATRIX_REQUIRE_MENTION=true
 MATRIX_FREE_RESPONSE_ROOMS=!abc123:matrix.org,!def456:matrix.org
+MATRIX_REQUIRE_MENTION_ROOMS=!locked789:matrix.org,!secure012:matrix.org
 MATRIX_AUTO_THREAD=true
 MATRIX_DM_MENTION_THREADS=false
 MATRIX_REACTIONS=true          # default: true — emoji reactions during processing

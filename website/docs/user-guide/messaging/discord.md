@@ -277,6 +277,7 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `DISCORD_HOME_CHANNEL_NAME` | No | `"Home"` | Display name for the home channel in logs and status output. |
 | `DISCORD_REQUIRE_MENTION` | No | `true` | When `true`, the bot only responds in server channels when `@mentioned`. Set to `false` to respond to all messages in every channel. |
 | `DISCORD_FREE_RESPONSE_CHANNELS` | No | — | Comma-separated channel IDs where the bot responds without requiring an `@mention`, even when `DISCORD_REQUIRE_MENTION` is `true`. |
+| `DISCORD_REQUIRE_MENTION_CHANNELS` | No | — | Comma-separated channel IDs where the bot **always** requires an `@mention`, even when `DISCORD_REQUIRE_MENTION` is `false`. The inverse of `DISCORD_FREE_RESPONSE_CHANNELS`. |
 | `DISCORD_IGNORE_NO_MENTION` | No | `true` | When `true`, the bot stays silent if a message `@mentions` other users but does **not** mention the bot. Prevents the bot from jumping into conversations directed at other people. Only applies in server channels, not DMs. |
 | `DISCORD_AUTO_THREAD` | No | `true` | When `true`, automatically creates a new thread for every `@mention` in a text channel, so each conversation is isolated (similar to Slack behavior). Messages already inside threads or DMs are unaffected. |
 | `DISCORD_ALLOW_BOTS` | No | `"none"` | Controls how the bot handles messages from other Discord bots. `"none"` — ignore all other bots. `"mentions"` — only accept bot messages that `@mention` Hermes. `"all"` — accept all bot messages. |
@@ -302,6 +303,7 @@ The `discord` section in `~/.hermes/config.yaml` mirrors the env vars above. Con
 discord:
   require_mention: true           # Require @mention in server channels
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
+  require_mention_channels: ""    # Channel IDs that always require @mention (or YAML list)
   auto_thread: true               # Auto-create threads on @mention
   reactions: true                 # Add emoji reactions during processing
   ignored_channels: []            # Channel IDs where bot never responds
@@ -344,6 +346,26 @@ discord:
 If a thread's parent channel is in this list, the thread also becomes mention-free.
 
 Free-response channels also **skip auto-threading** — the bot replies inline rather than spinning off a new thread per message. This keeps the channel usable as a lightweight chat surface. If you want threading behavior, don't list the channel as free-response (use normal `@mention` flow instead).
+
+#### `discord.require_mention_channels`
+
+**Type:** string or list — **Default:** `""`
+
+Channel IDs where the bot **always** requires an `@mention` to respond, even when `require_mention` is globally set to `false`. This is the inverse of `free_response_channels` — use it to lock down specific channels while keeping the rest of the server mention-free.
+
+```yaml
+# String format
+discord:
+  require_mention_channels: "1234567890,9876543210"
+
+# List format
+discord:
+  require_mention_channels:
+    - 1234567890
+    - 9876543210
+```
+
+If a thread's parent channel is in this list, the thread also requires a mention.
 
 #### `discord.auto_thread`
 

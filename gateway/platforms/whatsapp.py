@@ -202,6 +202,15 @@ class WhatsAppAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _whatsapp_require_mention_chats(self) -> set[str]:
+        """Return WhatsApp chat IDs where bot mention is always required."""
+        raw = self.config.extra.get("require_mention_chats")
+        if raw is None:
+            raw = os.getenv("WHATSAPP_REQUIRE_MENTION_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     @staticmethod
     def _coerce_allow_list(raw) -> set[str]:
         """Parse allow_from / group_allow_from from config or env var."""
@@ -336,6 +345,16 @@ class WhatsAppAdapter(BasePlatformAdapter):
         chat_id = str(data.get("chatId") or "")
         if chat_id in self._whatsapp_free_response_chats():
             return True
+        if chat_id in self._whatsapp_require_mention_chats():
+            # Force mention in this chat even when global require_mention is off
+            body = str(data.get("body") or "").strip()
+            if body.startswith("/"):
+                return True
+            if self._message_is_reply_to_bot(data):
+                return True
+            if self._message_mentions_bot(data):
+                return True
+            return self._message_matches_mention_patterns(data)
         if not self._whatsapp_require_mention():
             return True
         body = str(data.get("body") or "").strip()

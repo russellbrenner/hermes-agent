@@ -155,6 +155,9 @@ MATTERMOST_ALLOWED_USERS=3uo8dkh1p7g1mfk49ear5fzs5c
 
 # Optional: channels where bot responds without @mention (comma-separated channel IDs)
 # MATTERMOST_FREE_RESPONSE_CHANNELS=channel_id_1,channel_id_2
+
+# Optional: channels where bot always requires @mention (comma-separated channel IDs)
+# MATTERMOST_REQUIRE_MENTION_CHANNELS=channel_id_3,channel_id_4
 ```
 
 Optional behavior settings in `~/.hermes/config.yaml`:
@@ -220,10 +223,22 @@ By default, the bot only responds in channels when `@mentioned`. You can change 
 |----------|---------|-------------|
 | `MATTERMOST_REQUIRE_MENTION` | `true` | Set to `false` to respond to all messages in channels (DMs always work). |
 | `MATTERMOST_FREE_RESPONSE_CHANNELS` | _(none)_ | Comma-separated channel IDs where the bot responds without `@mention`, even when require_mention is true. |
+| `MATTERMOST_REQUIRE_MENTION_CHANNELS` | _(none)_ | Comma-separated channel IDs where the bot **always** requires `@mention`, even when require_mention is false. The inverse of free_response_channels. |
 
 To find a channel ID in Mattermost: open the channel, click the channel name header, and look for the ID in the URL or channel details.
 
 When the bot is `@mentioned`, the mention is automatically stripped from the message before processing.
+
+### config.yaml
+
+You can also configure mention behavior in `~/.hermes/config.yaml`:
+
+```yaml
+mattermost:
+  require_mention: true
+  free_response_channels: "channel_id_1,channel_id_2"
+  require_mention_channels: "channel_id_3,channel_id_4"
+```
 
 ## Troubleshooting
 

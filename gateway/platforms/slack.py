@@ -1043,6 +1043,26 @@ class SlackAdapter(BasePlatformAdapter):
         if not is_dm and bot_uid:
             if channel_id in self._slack_free_response_channels():
                 pass  # Free-response channel — always process
+            elif channel_id in self._slack_require_mention_channels():
+                # Force-mention channel — require mention even if global is off
+                if not is_mentioned:
+                    reply_to_bot_thread = (
+                        is_thread_reply and event_thread_ts in self._bot_message_ts
+                    )
+                    in_mentioned_thread = (
+                        event_thread_ts is not None
+                        and event_thread_ts in self._mentioned_threads
+                    )
+                    has_session = (
+                        is_thread_reply
+                        and self._has_active_session_for_thread(
+                            channel_id=channel_id,
+                            thread_ts=event_thread_ts,
+                            user_id=user_id,
+                        )
+                    )
+                    if not reply_to_bot_thread and not in_mentioned_thread and not has_session:
+                        return
             elif not self._slack_require_mention():
                 pass  # Mention requirement disabled globally for Slack
             elif not is_mentioned:
@@ -1687,6 +1707,17 @@ class SlackAdapter(BasePlatformAdapter):
         raw = self.config.extra.get("free_response_channels")
         if raw is None:
             raw = os.getenv("SLACK_FREE_RESPONSE_CHANNELS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        if isinstance(raw, str) and raw.strip():
+            return {part.strip() for part in raw.split(",") if part.strip()}
+        return set()
+
+    def _slack_require_mention_channels(self) -> set:
+        """Return channel IDs where bot mention is always required."""
+        raw = self.config.extra.get("require_mention_channels")
+        if raw is None:
+            raw = os.getenv("SLACK_REQUIRE_MENTION_CHANNELS", "")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         if isinstance(raw, str) and raw.strip():

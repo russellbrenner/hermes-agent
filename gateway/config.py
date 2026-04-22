@@ -616,6 +616,11 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["SLACK_FREE_RESPONSE_CHANNELS"] = str(frc)
+                rmc = slack_cfg.get("require_mention_channels")
+                if rmc is not None and not os.getenv("SLACK_REQUIRE_MENTION_CHANNELS"):
+                    if isinstance(rmc, list):
+                        rmc = ",".join(str(v) for v in rmc)
+                    os.environ["SLACK_REQUIRE_MENTION_CHANNELS"] = str(rmc)
 
             # Discord settings → env vars (env vars take precedence)
             discord_cfg = yaml_cfg.get("discord", {})
@@ -627,6 +632,11 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
+                rmc = discord_cfg.get("require_mention_channels")
+                if rmc is not None and not os.getenv("DISCORD_REQUIRE_MENTION_CHANNELS"):
+                    if isinstance(rmc, list):
+                        rmc = ",".join(str(v) for v in rmc)
+                    os.environ["DISCORD_REQUIRE_MENTION_CHANNELS"] = str(rmc)
                 if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
                     os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
                 if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
@@ -676,6 +686,11 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] = str(frc)
+                rmc = telegram_cfg.get("require_mention_chats")
+                if rmc is not None and not os.getenv("TELEGRAM_REQUIRE_MENTION_CHATS"):
+                    if isinstance(rmc, list):
+                        rmc = ",".join(str(v) for v in rmc)
+                    os.environ["TELEGRAM_REQUIRE_MENTION_CHATS"] = str(rmc)
                 ignored_threads = telegram_cfg.get("ignored_threads")
                 if ignored_threads is not None and not os.getenv("TELEGRAM_IGNORED_THREADS"):
                     if isinstance(ignored_threads, list):
@@ -707,6 +722,11 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["WHATSAPP_FREE_RESPONSE_CHATS"] = str(frc)
+                rmc = whatsapp_cfg.get("require_mention_chats")
+                if rmc is not None and not os.getenv("WHATSAPP_REQUIRE_MENTION_CHATS"):
+                    if isinstance(rmc, list):
+                        rmc = ",".join(str(v) for v in rmc)
+                    os.environ["WHATSAPP_REQUIRE_MENTION_CHATS"] = str(rmc)
                 if "dm_policy" in whatsapp_cfg and not os.getenv("WHATSAPP_DM_POLICY"):
                     os.environ["WHATSAPP_DM_POLICY"] = str(whatsapp_cfg["dm_policy"]).lower()
                 af = whatsapp_cfg.get("allow_from")
@@ -734,11 +754,32 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["DINGTALK_FREE_RESPONSE_CHATS"] = str(frc)
+                rmc = dingtalk_cfg.get("require_mention_chats")
+                if rmc is not None and not os.getenv("DINGTALK_REQUIRE_MENTION_CHATS"):
+                    if isinstance(rmc, list):
+                        rmc = ",".join(str(v) for v in rmc)
+                    os.environ["DINGTALK_REQUIRE_MENTION_CHATS"] = str(rmc)
                 allowed = dingtalk_cfg.get("allowed_users")
                 if allowed is not None and not os.getenv("DINGTALK_ALLOWED_USERS"):
                     if isinstance(allowed, list):
                         allowed = ",".join(str(v) for v in allowed)
                     os.environ["DINGTALK_ALLOWED_USERS"] = str(allowed)
+
+            # Mattermost settings → env vars (env vars take precedence)
+            mattermost_cfg = yaml_cfg.get("mattermost", {})
+            if isinstance(mattermost_cfg, dict):
+                if "require_mention" in mattermost_cfg and not os.getenv("MATTERMOST_REQUIRE_MENTION"):
+                    os.environ["MATTERMOST_REQUIRE_MENTION"] = str(mattermost_cfg["require_mention"]).lower()
+                frc = mattermost_cfg.get("free_response_channels")
+                if frc is not None and not os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS"):
+                    if isinstance(frc, list):
+                        frc = ",".join(str(v) for v in frc)
+                    os.environ["MATTERMOST_FREE_RESPONSE_CHANNELS"] = str(frc)
+                rmc = mattermost_cfg.get("require_mention_channels")
+                if rmc is not None and not os.getenv("MATTERMOST_REQUIRE_MENTION_CHANNELS"):
+                    if isinstance(rmc, list):
+                        rmc = ",".join(str(v) for v in rmc)
+                    os.environ["MATTERMOST_REQUIRE_MENTION_CHANNELS"] = str(rmc)
 
             # Matrix settings → env vars (env vars take precedence)
             matrix_cfg = yaml_cfg.get("matrix", {})
@@ -750,6 +791,11 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["MATRIX_FREE_RESPONSE_ROOMS"] = str(frc)
+                rmc = matrix_cfg.get("require_mention_rooms")
+                if rmc is not None and not os.getenv("MATRIX_REQUIRE_MENTION_ROOMS"):
+                    if isinstance(rmc, list):
+                        rmc = ",".join(str(v) for v in rmc)
+                    os.environ["MATRIX_REQUIRE_MENTION_ROOMS"] = str(rmc)
                 if "auto_thread" in matrix_cfg and not os.getenv("MATRIX_AUTO_THREAD"):
                     os.environ["MATRIX_AUTO_THREAD"] = str(matrix_cfg["auto_thread"]).lower()
                 if "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):

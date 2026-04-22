@@ -247,14 +247,9 @@ class MatrixAdapter(BasePlatformAdapter):
         # Thread participation tracking (for require_mention bypass)
         self._threads = ThreadParticipationTracker("matrix")
 
-        # Mention/thread gating — parsed once from env vars.
-        self._require_mention: bool = os.getenv(
-            "MATRIX_REQUIRE_MENTION", "true"
-        ).lower() not in ("false", "0", "no")
-        free_rooms_raw = os.getenv("MATRIX_FREE_RESPONSE_ROOMS", "")
-        self._free_rooms: Set[str] = {
-            r.strip() for r in free_rooms_raw.split(",") if r.strip()
-        }
+        # Mention/thread gating — legacy init-time parsing kept for backward
+        # compat; runtime code uses the helper methods below which also
+        # check config.extra (config.yaml) first.
         self._auto_thread: bool = os.getenv("MATRIX_AUTO_THREAD", "true").lower() in (
             "true",
             "1",
@@ -1262,9 +1257,13 @@ class MatrixAdapter(BasePlatformAdapter):
 
         # Require-mention gating.
         if not is_dm:
-            is_free_room = room_id in self._free_rooms
+            is_free_room = room_id in self._matrix_free_response_rooms()
+            is_force_mention = room_id in self._matrix_require_mention_rooms()
             in_bot_thread = bool(thread_id and thread_id in self._threads)
-            if self._require_mention and not is_free_room and not in_bot_thread:
+            require_mention = self._matrix_require_mention()
+            if is_free_room:
+                pass  # Free-response room — always respond
+            elif (is_force_mention or require_mention) and not in_bot_thread:
                 if not is_mentioned:
                     return None
 
@@ -1274,7 +1273,7 @@ class MatrixAdapter(BasePlatformAdapter):
             self._threads.mark(thread_id)
 
         # Strip mention from body (only when mention-gating is active).
-        if is_mentioned and self._require_mention:
+        if is_mentioned and self._matrix_require_mention():
             body = self._strip_mention(body)
 
         # Auto-thread.
@@ -1957,6 +1956,41 @@ class MatrixAdapter(BasePlatformAdapter):
                 dm_room_ids.update(str(r) for r in rooms)
 
         self._dm_rooms = {rid: (rid in dm_room_ids) for rid in self._joined_rooms}
+
+    # ------------------------------------------------------------------
+    # Mention-gating helpers
+    # ------------------------------------------------------------------
+
+    def _matrix_require_mention(self) -> bool:
+        """Return whether Matrix room messages require a bot mention."""
+        configured = self.config.extra.get("require_mention")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in ("false", "0", "no", "off")
+            return bool(configured)
+        return os.getenv("MATRIX_REQUIRE_MENTION", "true").lower() not in ("false", "0", "no", "off")
+
+    def _matrix_free_response_rooms(self) -> set:
+        """Return Matrix room IDs where no bot mention is required."""
+        raw = self.config.extra.get("free_response_rooms")
+        if raw is None:
+            raw = os.getenv("MATRIX_FREE_RESPONSE_ROOMS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        if isinstance(raw, str) and raw.strip():
+            return {part.strip() for part in raw.split(",") if part.strip()}
+        return set()
+
+    def _matrix_require_mention_rooms(self) -> set:
+        """Return Matrix room IDs where bot mention is always required."""
+        raw = self.config.extra.get("require_mention_rooms")
+        if raw is None:
+            raw = os.getenv("MATRIX_REQUIRE_MENTION_ROOMS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        if isinstance(raw, str) and raw.strip():
+            return {part.strip() for part in raw.split(",") if part.strip()}
+        return set()
 
     # ------------------------------------------------------------------
     # Mention detection helpers

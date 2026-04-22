@@ -498,6 +498,41 @@ class MattermostAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=data["id"])
 
     # ------------------------------------------------------------------
+    # Mention-gating helpers
+    # ------------------------------------------------------------------
+
+    def _mattermost_require_mention(self) -> bool:
+        """Return whether Mattermost channel messages require a bot mention."""
+        configured = self.config.extra.get("require_mention")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in ("false", "0", "no", "off")
+            return bool(configured)
+        return os.getenv("MATTERMOST_REQUIRE_MENTION", "true").lower() not in ("false", "0", "no", "off")
+
+    def _mattermost_free_response_channels(self) -> set:
+        """Return Mattermost channel IDs where no bot mention is required."""
+        raw = self.config.extra.get("free_response_channels")
+        if raw is None:
+            raw = os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        if isinstance(raw, str) and raw.strip():
+            return {part.strip() for part in raw.split(",") if part.strip()}
+        return set()
+
+    def _mattermost_require_mention_channels(self) -> set:
+        """Return Mattermost channel IDs where bot mention is always required."""
+        raw = self.config.extra.get("require_mention_channels")
+        if raw is None:
+            raw = os.getenv("MATTERMOST_REQUIRE_MENTION_CHANNELS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        if isinstance(raw, str) and raw.strip():
+            return {part.strip() for part in raw.split(",") if part.strip()}
+        return set()
+
+    # ------------------------------------------------------------------
     # WebSocket
     # ------------------------------------------------------------------
 
@@ -613,17 +648,16 @@ class MattermostAdapter(BasePlatformAdapter):
         message_text = post.get("message", "")
 
         # Mention-gating for non-DM channels.
-        # Config (env vars):
-        #   MATTERMOST_REQUIRE_MENTION: Require @mention in channels (default: true)
-        #   MATTERMOST_FREE_RESPONSE_CHANNELS: Channel IDs where bot responds without mention
+        # Config (config.yaml mattermost.* keys or env vars):
+        #   require_mention / MATTERMOST_REQUIRE_MENTION: Require @mention in channels (default: true)
+        #   free_response_channels / MATTERMOST_FREE_RESPONSE_CHANNELS: Channel IDs where bot responds without mention
+        #   require_mention_channels / MATTERMOST_REQUIRE_MENTION_CHANNELS: Channel IDs that always require mention
         if channel_type_raw != "D":
-            require_mention = os.getenv(
-                "MATTERMOST_REQUIRE_MENTION", "true"
-            ).lower() not in ("false", "0", "no")
-
-            free_channels_raw = os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS", "")
-            free_channels = {ch.strip() for ch in free_channels_raw.split(",") if ch.strip()}
+            require_mention = self._mattermost_require_mention()
+            free_channels = self._mattermost_free_response_channels()
+            require_mention_chs = self._mattermost_require_mention_channels()
             is_free_channel = channel_id in free_channels
+            is_force_mention = channel_id in require_mention_chs
 
             mention_patterns = [
                 f"@{self._bot_username}",
@@ -634,7 +668,9 @@ class MattermostAdapter(BasePlatformAdapter):
                 for pattern in mention_patterns
             )
 
-            if require_mention and not is_free_channel and not has_mention:
+            if is_free_channel:
+                pass  # Free-response channel — always respond
+            elif (is_force_mention or require_mention) and not has_mention:
                 logger.debug(
                     "Mattermost: skipping non-DM message without @mention (channel=%s)",
                     channel_id,

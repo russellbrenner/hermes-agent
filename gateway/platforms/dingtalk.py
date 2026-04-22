@@ -361,6 +361,15 @@ class DingTalkAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _dingtalk_require_mention_chats(self) -> Set[str]:
+        """Return DingTalk chat IDs where bot mention is always required."""
+        raw = self.config.extra.get("require_mention_chats")
+        if raw is None:
+            raw = os.getenv("DINGTALK_REQUIRE_MENTION_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     def _compile_mention_patterns(self) -> List[re.Pattern]:
         """Compile optional regex wake-word patterns for group triggers."""
         patterns = self.config.extra.get("mention_patterns") if self.config.extra else None
@@ -448,6 +457,11 @@ class DingTalkAdapter(BasePlatformAdapter):
             return True
         if chat_id and chat_id in self._dingtalk_free_response_chats():
             return True
+        if chat_id and chat_id in self._dingtalk_require_mention_chats():
+            # Force mention in this chat even when global require_mention is off
+            if self._message_mentions_bot(message):
+                return True
+            return self._message_matches_mention_patterns(text)
         if not self._dingtalk_require_mention():
             return True
         if self._message_mentions_bot(message):

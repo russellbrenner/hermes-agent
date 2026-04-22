@@ -2223,6 +2223,15 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_require_mention_chats(self) -> set[str]:
+        """Return Telegram chat IDs where bot mention is always required."""
+        raw = self.config.extra.get("require_mention_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_REQUIRE_MENTION_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     def _telegram_ignored_threads(self) -> set[int]:
         raw = self.config.extra.get("ignored_threads")
         if raw is None:
@@ -2375,6 +2384,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning("[%s] Ignoring non-numeric Telegram message_thread_id: %r", self.name, thread_id)
         if str(getattr(getattr(message, "chat", None), "id", "")) in self._telegram_free_response_chats():
             return True
+        if str(getattr(getattr(message, "chat", None), "id", "")) in self._telegram_require_mention_chats():
+            # Force mention in this chat even when global require_mention is off
+            if self._is_reply_to_bot(message):
+                return True
+            if self._message_mentions_bot(message):
+                return True
+            return self._message_matches_mention_patterns(message)
         if not self._telegram_require_mention():
             return True
         if self._is_reply_to_bot(message):

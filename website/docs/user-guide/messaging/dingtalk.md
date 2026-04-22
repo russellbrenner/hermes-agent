@@ -198,6 +198,27 @@ display:
       interim_assistant_messages: false
 ```
 
+## Mention Behavior
+
+By default, the bot only responds in group chats when `@mentioned`. You can change this:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DINGTALK_REQUIRE_MENTION` | `true` | Set to `false` to respond to all messages in group chats (DMs always work). |
+| `DINGTALK_FREE_RESPONSE_CHATS` | _(none)_ | Comma-separated chat IDs where the bot responds without `@mention`, even when require_mention is true. |
+| `DINGTALK_REQUIRE_MENTION_CHATS` | _(none)_ | Comma-separated chat IDs where the bot **always** requires `@mention`, even when require_mention is false. The inverse of free_response_chats. |
+
+### config.yaml
+
+You can also configure mention behavior in `~/.hermes/config.yaml`:
+
+```yaml
+dingtalk:
+  require_mention: true
+  free_response_chats: ""
+  require_mention_chats: "chat_id_1,chat_id_2"
+```
+
 ## Troubleshooting
 
 ### Bot is not responding to messages

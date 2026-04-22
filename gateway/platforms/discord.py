@@ -2497,6 +2497,17 @@ class DiscordAdapter(BasePlatformAdapter):
             return {part.strip() for part in raw.split(",") if part.strip()}
         return set()
 
+    def _discord_require_mention_channels(self) -> set:
+        """Return Discord channel IDs where bot mention is always required."""
+        raw = self.config.extra.get("require_mention_channels")
+        if raw is None:
+            raw = os.getenv("DISCORD_REQUIRE_MENTION_CHANNELS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        if isinstance(raw, str) and raw.strip():
+            return {part.strip() for part in raw.split(",") if part.strip()}
+        return set()
+
     def _thread_parent_channel(self, channel: Any) -> Any:
         """Return the parent text channel when invoked from a thread."""
         return getattr(channel, "parent", None) or channel
@@ -2996,18 +3007,22 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel_ids.add(parent_channel_id)
 
             require_mention = self._discord_require_mention()
+            require_mention_chs = self._discord_require_mention_channels()
             # Voice-linked text channels act as free-response while voice is active.
             # Only the exact bound channel gets the exemption, not sibling threads.
             voice_linked_ids = {str(ch_id) for ch_id in self._voice_text_channels.values()}
             current_channel_id = str(message.channel.id)
             is_voice_linked_channel = current_channel_id in voice_linked_ids
             is_free_channel = bool(channel_ids & free_channels) or is_voice_linked_channel
+            is_force_mention = bool(channel_ids & require_mention_chs)
 
             # Skip the mention check if the message is in a thread where
             # the bot has previously participated (auto-created or replied in).
             in_bot_thread = is_thread and thread_id in self._threads
 
-            if require_mention and not is_free_channel and not in_bot_thread:
+            if is_free_channel:
+                pass  # Free-response channel — always respond
+            elif (is_force_mention or require_mention) and not in_bot_thread:
                 if self._client.user not in message.mentions and not mention_prefix:
                     return
         # Auto-thread: when enabled, automatically create a thread for every
