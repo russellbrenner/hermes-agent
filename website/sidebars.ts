@@ -61,6 +61,7 @@ const sidebars: SidebarsConfig = {
             'user-guide/features/cron',
             'user-guide/features/delegation',
             'user-guide/features/kanban',
+            'user-guide/features/kanban-tutorial',
             'user-guide/features/code-execution',
             'user-guide/features/hooks',
             'user-guide/features/batch-processing',
