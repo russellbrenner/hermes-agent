@@ -682,7 +682,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print()
         print(f"Runs ({len(runs)}):")
         for r in runs:
-            elapsed = (r.ended_at - r.started_at) if r.ended_at else None
+            # Clamp to 0 so NTP backward-jumps don't print negative seconds.
+            elapsed = (max(0, r.ended_at - r.started_at)
+                       if r.ended_at else None)
             el = f"{elapsed}s" if elapsed is not None else "active"
             outcome = r.outcome or r.status or "active"
             print(f"  #{r.id:<3} {outcome:<12} @{r.profile or '-'}  {el}  "
@@ -1151,7 +1153,8 @@ def _cmd_runs(args: argparse.Namespace) -> int:
     print(f"{'#':3s}  {'OUTCOME':12s}  {'PROFILE':16s}  {'ELAPSED':>8s}  STARTED")
     for i, r in enumerate(runs, 1):
         end = r.ended_at or int(time.time())
-        elapsed = end - r.started_at
+        # Clamp to 0 so NTP backward-jumps don't print negative durations.
+        elapsed = max(0, end - r.started_at)
         if elapsed < 60:
             el = f"{elapsed}s"
         elif elapsed < 3600:

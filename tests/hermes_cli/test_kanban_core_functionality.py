@@ -1986,3 +1986,41 @@ def test_task_ids_dont_collide_at_scale(kanban_home):
             assert len(tid) == 10  # "t_" + 8 hex chars
     finally:
         conn.close()
+
+
+def test_cli_show_clamps_negative_elapsed(kanban_home):
+    """When NTP jumps backward between claim and complete, started_at
+    can exceed ended_at. CLI display must clamp to 0, not print '-3600s'.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="time-skewed", assignee="worker")
+        kb.claim_task(conn, tid)
+        # Force a future started_at via raw SQL — simulates NTP jump.
+        future = int(time.time()) + 3600
+        conn.execute(
+            "UPDATE task_runs SET started_at = ? WHERE task_id = ?",
+            (future, tid),
+        )
+        conn.commit()
+        # Complete normally (ended_at < started_at now)
+        kb.complete_task(conn, tid, summary="after skew")
+    finally:
+        conn.close()
+
+    # Both `show` and `runs` render this. Neither should display a
+    # negative elapsed token. We check specifically for the pattern
+    # `-<digits>s` (the elapsed column) rather than any minus sign,
+    # since timestamps legitimately contain dashes (2026-04-28).
+    out_show = run_slash(f"show {tid}")
+    out_runs = run_slash(f"runs {tid}")
+    import re as _re
+    neg_elapsed = _re.compile(r"-\d+s")
+    assert not neg_elapsed.search(out_show), (
+        f"show output has negative elapsed: {out_show!r}"
+    )
+    assert not neg_elapsed.search(out_runs), (
+        f"runs output has negative elapsed: {out_runs!r}"
+    )
+    # Should show "0s" for the clamped elapsed
+    assert "0s" in out_show or "0s" in out_runs
