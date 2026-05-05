@@ -16,7 +16,7 @@ const MAX_WIDTH = 90
 
 type Stage = 'provider' | 'key' | 'model' | 'disconnect'
 
-export function ModelPicker({ gw, onCancel, onSelect, sessionId, t }: ModelPickerProps) {
+export function ModelPicker({ gw, maxWidth, onCancel, onSelect, sessionId, t }: ModelPickerProps) {
   const [providers, setProviders] = useState<ModelOptionProvider[]>([])
   const [currentModel, setCurrentModel] = useState('')
   const [err, setErr] = useState('')
@@ -30,11 +30,13 @@ export function ModelPicker({ gw, onCancel, onSelect, sessionId, t }: ModelPicke
   const [keyError, setKeyError] = useState('')
 
   const { stdout } = useStdout()
-  // Pin the picker to a stable width so the FloatBox parent (which shrinks-
-  // to-fit with alignSelf="flex-start") doesn't resize as long provider /
-  // model names scroll into view, and so `wrap="truncate-end"` on each row
-  // has an actual constraint to truncate against.
-  const width = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, (stdout?.columns ?? 80) - 6))
+  // Pin the picker to a stable width so the FloatBox parent doesn't resize as
+  // long provider/model names scroll into view. Optional maxWidth lets
+  // callers constrain it inside multi-column widget layouts.
+  const terminalWidth = Math.max(1, (stdout?.columns ?? 80) - 6)
+  const preferredWidth = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, terminalWidth))
+  const widthCap = Math.max(24, Math.trunc(maxWidth ?? preferredWidth))
+  const width = Math.max(24, Math.min(preferredWidth, widthCap))
 
   useEffect(() => {
     gw.request<ModelOptionsResponse>('model.options', sessionId ? { session_id: sessionId } : {})
@@ -105,7 +107,7 @@ export function ModelPicker({ gw, onCancel, onSelect, sessionId, t }: ModelPicke
         gw.request<{ provider?: ModelOptionProvider }>('model.save_key', {
           slug: provider?.slug,
           api_key: keyInput.trim(),
-          ...(sessionId ? { session_id: sessionId } : {}),
+          ...(sessionId ? { session_id: sessionId } : {})
         })
           .then(raw => {
             const r = asRpcResult<{ provider?: ModelOptionProvider }>(raw)
@@ -118,9 +120,7 @@ export function ModelPicker({ gw, onCancel, onSelect, sessionId, t }: ModelPicke
             }
 
             // Update the provider in our list with fresh data
-            setProviders(prev =>
-              prev.map(p => p.slug === r.provider!.slug ? r.provider! : p)
-            )
+            setProviders(prev => prev.map(p => (p.slug === r.provider!.slug ? r.provider! : p)))
             setKeyInput('')
             setKeySaving(false)
             setStage('model')
@@ -166,7 +166,7 @@ export function ModelPicker({ gw, onCancel, onSelect, sessionId, t }: ModelPicke
         setKeySaving(true)
         gw.request<{ disconnected?: boolean }>('model.disconnect', {
           slug: provider.slug,
-          ...(sessionId ? { session_id: sessionId } : {}),
+          ...(sessionId ? { session_id: sessionId } : {})
         })
           .then(raw => {
             const r = asRpcResult<{ disconnected?: boolean }>(raw)
@@ -174,9 +174,16 @@ export function ModelPicker({ gw, onCancel, onSelect, sessionId, t }: ModelPicke
             if (r?.disconnected) {
               // Mark provider as unauthenticated in local state
               setProviders(prev =>
-                prev.map(p => p.slug === provider.slug
-                  ? { ...p, authenticated: false, models: [], total_models: 0, warning: p.key_env ? `paste ${p.key_env} to activate` : 'run `hermes model` to configure' }
-                  : p
+                prev.map(p =>
+                  p.slug === provider.slug
+                    ? {
+                        ...p,
+                        authenticated: false,
+                        models: [],
+                        total_models: 0,
+                        warning: p.key_env ? `paste ${p.key_env} to activate` : 'run `hermes model` to configure'
+                      }
+                    : p
                 )
               )
             }
@@ -302,17 +309,23 @@ export function ModelPicker({ gw, onCancel, onSelect, sessionId, t }: ModelPicke
           Paste your API key below (saved to ~/.hermes/.env)
         </Text>
 
-        <Text color={t.color.muted} wrap="truncate-end"> </Text>
+        <Text color={t.color.muted} wrap="truncate-end">
+          {' '}
+        </Text>
 
         <Text color={t.color.muted} wrap="truncate-end">
           {provider.key_env}:
         </Text>
 
         <Text color={t.color.accent} wrap="truncate-end">
-          {'  '}{masked || '(empty)'}{keySaving ? '' : '▎'}
+          {'  '}
+          {masked || '(empty)'}
+          {keySaving ? '' : '▎'}
         </Text>
 
-        <Text color={t.color.muted} wrap="truncate-end"> </Text>
+        <Text color={t.color.muted} wrap="truncate-end">
+          {' '}
+        </Text>
 
         {keyError ? (
           <Text color={t.color.label} wrap="truncate-end">
@@ -323,7 +336,9 @@ export function ModelPicker({ gw, onCancel, onSelect, sessionId, t }: ModelPicke
             saving…
           </Text>
         ) : (
-          <Text color={t.color.muted} wrap="truncate-end"> </Text>
+          <Text color={t.color.muted} wrap="truncate-end">
+            {' '}
+          </Text>
         )}
 
         <OverlayHint t={t}>Enter save · Ctrl+U clear · Esc back</OverlayHint>
@@ -339,7 +354,9 @@ export function ModelPicker({ gw, onCancel, onSelect, sessionId, t }: ModelPicke
           Disconnect {provider.name}?
         </Text>
 
-        <Text color={t.color.muted} wrap="truncate-end"> </Text>
+        <Text color={t.color.muted} wrap="truncate-end">
+          {' '}
+        </Text>
 
         <Text color={t.color.muted} wrap="truncate-end">
           This removes saved credentials for {provider.name}.
@@ -349,10 +366,14 @@ export function ModelPicker({ gw, onCancel, onSelect, sessionId, t }: ModelPicke
           You can re-authenticate later by selecting it again.
         </Text>
 
-        <Text color={t.color.muted} wrap="truncate-end"> </Text>
+        <Text color={t.color.muted} wrap="truncate-end">
+          {' '}
+        </Text>
 
         {keySaving ? (
-          <Text color={t.color.muted} wrap="truncate-end">disconnecting…</Text>
+          <Text color={t.color.muted} wrap="truncate-end">
+            disconnecting…
+          </Text>
         ) : (
           <OverlayHint t={t}>y/Enter confirm · n/Esc cancel</OverlayHint>
         )}
@@ -362,17 +383,14 @@ export function ModelPicker({ gw, onCancel, onSelect, sessionId, t }: ModelPicke
 
   // ── Provider selection stage ─────────────────────────────────────────
   if (stage === 'provider') {
-    const rows = providers.map(
-      (p, i) => {
-        const authMark = p.authenticated === false ? '○' : p.is_current ? '*' : '●'
-        const modelCount = p.total_models ?? p.models?.length ?? 0
-        const suffix = p.authenticated === false
-          ? (p.auth_type === 'api_key' ? '(no key)' : '(needs setup)')
-          : `${modelCount} models`
+    const rows = providers.map((p, i) => {
+      const authMark = p.authenticated === false ? '○' : p.is_current ? '*' : '●'
+      const modelCount = p.total_models ?? p.models?.length ?? 0
+      const suffix =
+        p.authenticated === false ? (p.auth_type === 'api_key' ? '(no key)' : '(needs setup)') : `${modelCount} models`
 
-        return `${authMark} ${names[i]} · ${suffix}`
-      }
-    )
+      return `${authMark} ${names[i]} · ${suffix}`
+    })
 
     const { items, offset } = windowItems(rows, providerIdx, VISIBLE)
 
@@ -499,6 +517,7 @@ export function ModelPicker({ gw, onCancel, onSelect, sessionId, t }: ModelPicke
 
 interface ModelPickerProps {
   gw: GatewayClient
+  maxWidth?: number
   onCancel: () => void
   onSelect: (value: string) => void
   sessionId: string | null

@@ -26,7 +26,7 @@ const age = (ts: number) => {
   return `${Math.floor(d)}d ago`
 }
 
-export function SessionPicker({ gw, onCancel, onSelect, t }: SessionPickerProps) {
+export function SessionPicker({ gw, maxWidth, onCancel, onSelect, t }: SessionPickerProps) {
   const [items, setItems] = useState<SessionListItem[]>([])
   const [err, setErr] = useState('')
   const [sel, setSel] = useState(0)
@@ -37,7 +37,10 @@ export function SessionPicker({ gw, onCancel, onSelect, t }: SessionPickerProps)
   const [deleting, setDeleting] = useState(false)
 
   const { stdout } = useStdout()
-  const width = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, (stdout?.columns ?? 80) - 6))
+  const terminalWidth = Math.max(1, (stdout?.columns ?? 80) - 6)
+  const preferredWidth = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, terminalWidth))
+  const widthCap = Math.max(24, Math.trunc(maxWidth ?? preferredWidth))
+  const width = Math.max(24, Math.min(preferredWidth, widthCap))
 
   useOverlayKeys({ onClose: onCancel })
 
@@ -171,7 +174,7 @@ export function SessionPicker({ gw, onCancel, onSelect, t }: SessionPickerProps)
         Resume Session
       </Text>
 
-      {offset > 0 && <Text color={t.color.muted}>  ↑ {offset} more</Text>}
+      {offset > 0 && <Text color={t.color.muted}> ↑ {offset} more</Text>}
 
       {items.slice(offset, offset + VISIBLE).map((s, vi) => {
         const i = offset + vi
@@ -208,7 +211,7 @@ export function SessionPicker({ gw, onCancel, onSelect, t }: SessionPickerProps)
         )
       })}
 
-      {offset + VISIBLE < items.length && <Text color={t.color.muted}>  ↓ {items.length - offset - VISIBLE} more</Text>}
+      {offset + VISIBLE < items.length && <Text color={t.color.muted}> ↓ {items.length - offset - VISIBLE} more</Text>}
       {err && <Text color={t.color.label}>error: {err}</Text>}
       {deleting ? (
         <OverlayHint t={t}>deleting…</OverlayHint>
@@ -221,6 +224,7 @@ export function SessionPicker({ gw, onCancel, onSelect, t }: SessionPickerProps)
 
 interface SessionPickerProps {
   gw: GatewayClient
+  maxWidth?: number
   onCancel: () => void
   onSelect: (id: string) => void
   t: Theme
