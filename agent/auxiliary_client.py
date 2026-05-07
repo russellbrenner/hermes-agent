@@ -1022,7 +1022,10 @@ def _maybe_wrap_anthropic(
         return client_obj
 
     try:
-        from agent.anthropic_adapter import build_anthropic_client
+        from agent.anthropic_adapter import (
+            build_anthropic_client,
+            resolve_passthrough_llm_headers,
+        )
     except ImportError:
         logger.warning(
             "Endpoint %s speaks Anthropic Messages but the anthropic SDK is "
@@ -1032,7 +1035,10 @@ def _maybe_wrap_anthropic(
         return client_obj
 
     try:
-        real_client = build_anthropic_client(api_key, base_url)
+        real_client = build_anthropic_client(
+            api_key, base_url,
+            passthrough_oauth=resolve_passthrough_llm_headers(),
+        )
     except Exception as exc:
         logger.warning(
             "Failed to build Anthropic client for %s (%s) — falling back to "
@@ -1533,11 +1539,20 @@ def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
         return CodexAuxiliaryClient(real_client, model), model
     if custom_mode == "anthropic_messages":
         # Third-party Anthropic-compatible gateway (MiniMax, Zhipu GLM,
-        # LiteLLM proxies, etc.).  Must NEVER be treated as OAuth —
-        # Anthropic OAuth claims only apply to api.anthropic.com.
+        # LiteLLM proxies, etc.). OAuth-passthrough opts in for proxies
+        # that genuinely forward Claude Code identity headers upstream
+        # (e.g. LiteLLM in claude-code passthrough mode); otherwise the
+        # request goes out with x-api-key auth as before, preserving the
+        # MiniMax / Alibaba safety gate.
         try:
-            from agent.anthropic_adapter import build_anthropic_client
-            real_client = build_anthropic_client(custom_key, custom_base)
+            from agent.anthropic_adapter import (
+                build_anthropic_client,
+                resolve_passthrough_llm_headers,
+            )
+            real_client = build_anthropic_client(
+                custom_key, custom_base,
+                passthrough_oauth=resolve_passthrough_llm_headers(),
+            )
         except ImportError:
             logger.warning(
                 "Custom endpoint declares api_mode=anthropic_messages but the "
@@ -1637,7 +1652,11 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
     model = _get_aux_model_for_provider("anthropic") or "claude-haiku-4-5-20251001"
     logger.debug("Auxiliary client: Anthropic native (%s) at %s (oauth=%s)", model, base_url, is_oauth)
     try:
-        real_client = build_anthropic_client(token, base_url)
+        from agent.anthropic_adapter import resolve_passthrough_llm_headers
+        real_client = build_anthropic_client(
+            token, base_url,
+            passthrough_oauth=resolve_passthrough_llm_headers("anthropic"),
+        )
     except ImportError:
         # The anthropic_adapter module imports fine but the SDK itself is
         # missing — build_anthropic_client raises ImportError at call time
@@ -2377,8 +2396,14 @@ def resolve_provider_client(
                 # branch in _try_custom_endpoint(). See #15033.
                 if entry_api_mode == "anthropic_messages":
                     try:
-                        from agent.anthropic_adapter import build_anthropic_client
-                        real_client = build_anthropic_client(custom_key, custom_base)
+                        from agent.anthropic_adapter import (
+                            build_anthropic_client,
+                            resolve_passthrough_llm_headers,
+                        )
+                        real_client = build_anthropic_client(
+                            custom_key, custom_base,
+                            passthrough_oauth=resolve_passthrough_llm_headers(provider),
+                        )
                     except ImportError:
                         logger.warning(
                             "Named custom provider %r declares api_mode="

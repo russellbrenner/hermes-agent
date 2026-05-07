@@ -246,7 +246,12 @@ def _supports_fast_mode(model: str) -> bool:
 #
 # Migration guide: remove these if you no longer support ≤4.5 models or once
 # Bedrock/Azure promote 1M to GA.
-_COMMON_BETAS = [
+#
+# These are DEFAULTS — overridable via config under ``anthropic.protocol.*``
+# (see ``_load_anthropic_protocol_config``). Direct reads of these constants
+# inside this module remain valid; the config-aware resolvers ``_resolve_*_betas``
+# at the bottom of this section consult the config first.
+_COMMON_BETAS_DEFAULT = [
     "interleaved-thinking-2025-05-14",
     "fine-grained-tool-streaming-2025-05-14",
     "context-1m-2025-08-07",
@@ -267,17 +272,123 @@ _FAST_MODE_BETA = "fast-mode-2026-02-01"
 
 # Additional beta headers required for OAuth/subscription auth.
 # Matches what Claude Code (and pi-ai / OpenCode) send.
-_OAUTH_ONLY_BETAS = [
+_OAUTH_ONLY_BETAS_DEFAULT = [
     "claude-code-20250219",
     "oauth-2025-04-20",
 ]
+
+# Backward-compatibility aliases — older code reads these names directly.
+# Tests, in particular, patch ``_COMMON_BETAS`` and ``_OAUTH_ONLY_BETAS``.
+# Keep them in sync with the defaults; new call sites should prefer the
+# resolver functions.
+_COMMON_BETAS = _COMMON_BETAS_DEFAULT
+_OAUTH_ONLY_BETAS = _OAUTH_ONLY_BETAS_DEFAULT
 
 # Claude Code identity — required for OAuth requests to be routed correctly.
 # Without these, Anthropic's infrastructure intermittently 500s OAuth traffic.
 # The version must stay reasonably current — Anthropic rejects OAuth requests
 # when the spoofed user-agent version is too far behind the actual release.
 _CLAUDE_CODE_VERSION_FALLBACK = "2.1.74"
+_CLAUDE_CODE_USER_AGENT_TEMPLATE_DEFAULT = "claude-cli/{version} (external, cli)"
 _claude_code_version_cache: Optional[str] = None
+
+
+def _load_anthropic_protocol_config() -> dict:
+    """Read ``anthropic.protocol`` config knobs with safe fallbacks.
+
+    Centralises overrides for beta headers, Claude Code version, and user-agent
+    template so users can adapt to upstream Anthropic header changes without
+    editing source. Returns an empty dict (== all defaults) on any failure
+    (config missing, malformed, etc.) so this never breaks the import-time
+    or request-time path for users who haven't opted in.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config().get("anthropic") or {}
+        proto = cfg.get("protocol") or {}
+        return proto if isinstance(proto, dict) else {}
+    except Exception:
+        return {}
+
+
+def _resolve_common_betas() -> list[str]:
+    """Return effective common-betas list (config override + default + extend)."""
+    cfg = _load_anthropic_protocol_config()
+    base = cfg.get("common_betas")
+    base = list(base) if isinstance(base, list) else list(_COMMON_BETAS_DEFAULT)
+    extend = cfg.get("extend_betas")
+    if isinstance(extend, list):
+        base = base + list(extend)
+    return base
+
+
+def _resolve_oauth_only_betas() -> list[str]:
+    """Return effective OAuth-only-betas list (config override or default)."""
+    cfg = _load_anthropic_protocol_config()
+    override = cfg.get("oauth_only_betas")
+    return list(override) if isinstance(override, list) else list(_OAUTH_ONLY_BETAS_DEFAULT)
+
+
+def resolve_passthrough_llm_headers(provider_name: str | None = None) -> bool:
+    """Read the ``passthrough_llm_headers`` config flag — narrowest scope wins.
+
+    Resolution order:
+
+    1. ``providers.<provider_name>.passthrough_llm_headers`` — per named-custom
+       provider entry (matches LiteLLM-style multi-deployment configs).
+    2. ``model.passthrough_llm_headers`` — top-level default for the active
+       ``model:`` config.
+    3. ``False`` — built-in default. Preserves the pre-existing safety gate
+       against leaking Anthropic OAuth tokens to MiniMax / Alibaba / other
+       Anthropic-compatible providers that don't honour them.
+
+    When True and the resolved API key is an Anthropic OAuth token, callers
+    should pass ``passthrough_oauth=True`` to ``build_anthropic_client`` and
+    set ``is_oauth=True`` on subsequent ``build_anthropic_messages_kwargs``
+    invocations so the request body, auth header, and identity headers
+    consistently carry the Claude Code OAuth fingerprint upstream.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        if provider_name:
+            providers = cfg.get("providers") or {}
+            if isinstance(providers, dict):
+                entry = providers.get(provider_name)
+                if isinstance(entry, dict) and "passthrough_llm_headers" in entry:
+                    return bool(entry["passthrough_llm_headers"])
+        model_cfg = cfg.get("model") or {}
+        if isinstance(model_cfg, dict) and "passthrough_llm_headers" in model_cfg:
+            return bool(model_cfg["passthrough_llm_headers"])
+    except Exception:
+        pass
+    return False
+
+
+def _resolve_claude_code_user_agent() -> str:
+    """Return the Claude Code user-agent string with version interpolated.
+
+    Template is ``anthropic.protocol.user_agent`` (must contain ``{version}``)
+    or the built-in default. Version comes from
+    ``anthropic.protocol.claude_code_version`` (overrides dynamic detection).
+    """
+    cfg = _load_anthropic_protocol_config()
+    version_override = cfg.get("claude_code_version")
+    version = (
+        str(version_override)
+        if isinstance(version_override, str) and version_override.strip()
+        else _get_claude_code_version()
+    )
+    template = cfg.get("user_agent")
+    if not isinstance(template, str) or not template.strip() or "{version}" not in template:
+        # Missing / blank / no {version} placeholder — fall back. The placeholder
+        # check guards against silent breakage when a misconfigured template
+        # would otherwise emit a static UA that drifts from the spoofed version.
+        template = _CLAUDE_CODE_USER_AGENT_TEMPLATE_DEFAULT
+    try:
+        return template.format(version=version)
+    except (KeyError, IndexError, ValueError):
+        return _CLAUDE_CODE_USER_AGENT_TEMPLATE_DEFAULT.format(version=version)
 
 
 def _detect_claude_code_version() -> str:
@@ -361,7 +472,10 @@ def _is_third_party_anthropic_endpoint(base_url: str | None) -> bool:
 
     Third-party proxies (Azure AI Foundry, AWS Bedrock, self-hosted) authenticate
     with their own API keys via x-api-key, not Anthropic OAuth tokens. OAuth
-    detection should be skipped for these endpoints.
+    detection should be skipped for these endpoints UNLESS the caller has
+    opted into OAuth passthrough — see ``passthrough_oauth`` in
+    ``build_anthropic_client`` and the ``_forces_x_api_key_auth`` carve-out
+    for endpoints that genuinely cannot accept OAuth (Azure, Bedrock).
     """
     normalized = _normalize_base_url_text(base_url)
     if not normalized:
@@ -370,6 +484,25 @@ def _is_third_party_anthropic_endpoint(base_url: str | None) -> bool:
     if "anthropic.com" in normalized:
         return False  # Direct Anthropic API — OAuth applies
     return True  # Any other endpoint is a third-party proxy
+
+
+def _forces_x_api_key_auth(base_url: str | None) -> bool:
+    """Return True for third-party endpoints that genuinely cannot accept Anthropic OAuth.
+
+    Azure AI Foundry and AWS Bedrock host their own Claude deployments with
+    their own auth schemes (Azure key + ``api-version`` query, AWS SigV4
+    via boto3). They do not honour ``Authorization: Bearer <anthropic-oat>``
+    upstream and would 401 every request. ``passthrough_oauth=True`` does
+    NOT override this — these are technical incompatibilities, not policy.
+
+    Distinguished from generic third-party proxies (LiteLLM, OpenRouter
+    passthrough mode, custom Anthropic-compatible gateways) which CAN
+    forward OAuth tokens upstream when configured to do so.
+    """
+    normalized = (_normalize_base_url_text(base_url) or "").lower()
+    if not normalized:
+        return False
+    return ("azure.com" in normalized) or ("bedrock-runtime" in normalized)
 
 
 def _is_kimi_coding_endpoint(base_url: str | None) -> bool:
@@ -500,12 +633,13 @@ def _common_betas_for_base_url(
     reactive recovery loop in ``run_agent.py`` and issue-comment history on
     PR #17680 for the full rationale.
     """
+    common = _resolve_common_betas()
     if _requires_bearer_auth(base_url):
         _stripped = {_TOOL_STREAMING_BETA, _CONTEXT_1M_BETA}
-        return [b for b in _COMMON_BETAS if b not in _stripped]
+        return [b for b in common if b not in _stripped]
     if drop_context_1m_beta:
-        return [b for b in _COMMON_BETAS if b != _CONTEXT_1M_BETA]
-    return _COMMON_BETAS
+        return [b for b in common if b != _CONTEXT_1M_BETA]
+    return common
 
 
 def build_anthropic_client(
@@ -514,6 +648,7 @@ def build_anthropic_client(
     timeout: float = None,
     *,
     drop_context_1m_beta: bool = False,
+    passthrough_oauth: bool = False,
 ):
     """Create an Anthropic client, auto-detecting setup-tokens vs API keys.
 
@@ -528,6 +663,14 @@ def build_anthropic_client(
     path in ``run_agent.py`` when a subscription rejects the beta; leave at
     its default on fresh clients so 1M-capable subscriptions keep the
     capability.
+
+    ``passthrough_oauth=True`` opts a non-``anthropic.com`` URL into the
+    OAuth client-construction branch (Bearer auth + Claude Code identity
+    headers) when the supplied ``api_key`` looks like an Anthropic OAuth
+    token. Use when proxying Claude Code OAuth through LiteLLM, OpenRouter
+    passthrough, or another transparent Anthropic-compatible gateway that
+    forwards OAuth identity headers upstream. Azure / Bedrock are
+    auto-excluded regardless of this flag (see ``_forces_x_api_key_auth``).
 
     Returns an anthropic.Anthropic instance.
     """
@@ -582,25 +725,33 @@ def build_anthropic_client(
         kwargs["auth_token"] = api_key
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
-    elif _is_third_party_anthropic_endpoint(base_url):
-        # Third-party proxies (Azure AI Foundry, AWS Bedrock, etc.) use their
-        # own API keys with x-api-key auth. Skip OAuth detection — their keys
-        # don't follow Anthropic's sk-ant-* prefix convention and would be
-        # misclassified as OAuth tokens.
-        kwargs["api_key"] = api_key
-        if common_betas:
-            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
-    elif _is_oauth_token(api_key):
+    elif _is_oauth_token(api_key) and (
+        not _is_third_party_anthropic_endpoint(base_url)
+        or (passthrough_oauth and not _forces_x_api_key_auth(base_url))
+    ):
         # OAuth access token / setup-token → Bearer auth + Claude Code identity.
         # Anthropic routes OAuth requests based on user-agent and headers;
         # without Claude Code's fingerprint, requests get intermittent 500s.
-        all_betas = common_betas + _OAUTH_ONLY_BETAS
+        #
+        # Fires for native Anthropic AND for any non-anthropic.com URL when
+        # the caller opts in via passthrough_oauth=True (e.g. LiteLLM proxy
+        # forwarding Claude Code OAuth upstream). Azure / Bedrock are
+        # excluded by ``_forces_x_api_key_auth`` regardless of opt-in:
+        # they technically cannot accept OAuth tokens.
+        all_betas = list(common_betas) + _resolve_oauth_only_betas()
         kwargs["auth_token"] = api_key
         kwargs["default_headers"] = {
             "anthropic-beta": ",".join(all_betas),
-            "user-agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
+            "user-agent": _resolve_claude_code_user_agent(),
             "x-app": "cli",
         }
+    elif _is_third_party_anthropic_endpoint(base_url):
+        # Third-party proxies (Azure AI Foundry, AWS Bedrock, MiniMax, etc.)
+        # using a non-OAuth key. Use x-api-key auth — their keys don't follow
+        # Anthropic's sk-ant-* prefix convention.
+        kwargs["api_key"] = api_key
+        if common_betas:
+            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
     else:
         # Regular API key → x-api-key header + common betas
         kwargs["api_key"] = api_key
@@ -642,7 +793,7 @@ def build_anthropic_bedrock_client(region: str):
     return _anthropic_sdk.AnthropicBedrock(
         aws_region=region,
         timeout=Timeout(timeout=900.0, connect=10.0),
-        default_headers={"anthropic-beta": ",".join(_COMMON_BETAS)},
+        default_headers={"anthropic-beta": ",".join(_resolve_common_betas())},
     )
 
 
@@ -808,7 +959,7 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
             data=data,
             headers={
                 "Content-Type": content_type,
-                "User-Agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
+                "User-Agent": _resolve_claude_code_user_agent(),
             },
             method="POST",
         )
@@ -1118,7 +1269,7 @@ def run_hermes_oauth_login_pure() -> Optional[Dict[str, Any]]:
             data=exchange_data,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
+                "User-Agent": _resolve_claude_code_user_agent(),
             },
             method="POST",
         )
@@ -1961,7 +2112,7 @@ def build_anthropic_kwargs(
             drop_context_1m_beta=drop_context_1m_beta,
         ))
         if is_oauth:
-            betas.extend(_OAUTH_ONLY_BETAS)
+            betas.extend(_resolve_oauth_only_betas())
         betas.append(_FAST_MODE_BETA)
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
 

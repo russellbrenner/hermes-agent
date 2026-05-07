@@ -1376,16 +1376,38 @@ class AIAgent:
                 self.api_key = effective_key
                 self._anthropic_api_key = effective_key
                 self._anthropic_base_url = base_url
-                # Only mark the session as OAuth-authenticated when the token
-                # genuinely belongs to native Anthropic.  Third-party providers
-                # (MiniMax, Kimi, GLM, LiteLLM proxies) that accept the
-                # Anthropic protocol must never trip OAuth code paths — doing
-                # so injects Claude-Code identity headers and system prompts
-                # that cause 401/403 on their endpoints.  Guards #1739 and
-                # the third-party identity-injection bug.
-                from agent.anthropic_adapter import _is_oauth_token as _is_oat
-                self._is_anthropic_oauth = _is_oat(effective_key) if _is_native_anthropic else False
-                self._anthropic_client = build_anthropic_client(effective_key, base_url, timeout=_provider_timeout)
+                # OAuth-authentication gate.  By default, only mark the session
+                # as OAuth-authenticated when the token genuinely belongs to
+                # native Anthropic — third-party providers (MiniMax, Kimi, GLM)
+                # that accept the Anthropic protocol must never trip OAuth code
+                # paths because doing so injects Claude-Code identity headers
+                # and system prompts that cause 401/403 on their endpoints.
+                # Guards #1739 and the third-party identity-injection bug.
+                #
+                # Opt-in escape hatch: ``passthrough_llm_headers`` (read from
+                # providers.<name>.passthrough_llm_headers OR model.passthrough_llm_headers,
+                # narrowest wins) tells us the proxy DOES forward OAuth identity
+                # headers upstream (e.g. LiteLLM in claude-code passthrough
+                # mode). When set, OAuth detection runs even on non-anthropic.com
+                # URLs. Azure / Bedrock are still excluded inside
+                # build_anthropic_client via _forces_x_api_key_auth.
+                from agent.anthropic_adapter import (
+                    _is_oauth_token as _is_oat,
+                    resolve_passthrough_llm_headers,
+                )
+                _passthrough = resolve_passthrough_llm_headers(self.provider)
+                self._passthrough_llm_headers = _passthrough
+                self._is_anthropic_oauth = (
+                    _is_oat(effective_key)
+                    if (_is_native_anthropic or _passthrough)
+                    else False
+                )
+                self._anthropic_client = build_anthropic_client(
+                    effective_key,
+                    base_url,
+                    timeout=_provider_timeout,
+                    passthrough_oauth=_passthrough,
+                )
                 # No OpenAI client needed for Anthropic mode
                 self.client = None
                 self._client_kwargs = {}
@@ -2224,6 +2246,7 @@ class AIAgent:
                 "anthropic_api_key": self._anthropic_api_key,
                 "anthropic_base_url": self._anthropic_base_url,
                 "is_anthropic_oauth": self._is_anthropic_oauth,
+                "passthrough_llm_headers": getattr(self, "_passthrough_llm_headers", False),
             })
 
     def _ensure_db_session(self) -> None:
@@ -2373,6 +2396,7 @@ class AIAgent:
                 build_anthropic_client,
                 resolve_anthropic_token,
                 _is_oauth_token,
+                resolve_passthrough_llm_headers,
             )
             # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
             # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own
@@ -2382,11 +2406,18 @@ class AIAgent:
             self.api_key = effective_key
             self._anthropic_api_key = effective_key
             self._anthropic_base_url = base_url or getattr(self, "_anthropic_base_url", None)
+            _passthrough = resolve_passthrough_llm_headers(new_provider)
+            self._passthrough_llm_headers = _passthrough
             self._anthropic_client = build_anthropic_client(
                 effective_key, self._anthropic_base_url,
                 timeout=get_provider_request_timeout(self.provider, self.model),
+                passthrough_oauth=_passthrough,
             )
-            self._is_anthropic_oauth = _is_oauth_token(effective_key) if _is_native_anthropic else False
+            self._is_anthropic_oauth = (
+                _is_oauth_token(effective_key)
+                if (_is_native_anthropic or _passthrough)
+                else False
+            )
             self.client = None
             self._client_kwargs = {}
         else:
@@ -2474,6 +2505,7 @@ class AIAgent:
                 "anthropic_api_key": self._anthropic_api_key,
                 "anthropic_base_url": self._anthropic_base_url,
                 "is_anthropic_oauth": self._is_anthropic_oauth,
+                "passthrough_llm_headers": getattr(self, "_passthrough_llm_headers", False),
             })
 
         # ── Reset fallback state ──
@@ -6241,11 +6273,13 @@ class AIAgent:
         except Exception:
             pass
 
+        _passthrough = bool(getattr(self, "_passthrough_llm_headers", False))
         try:
             self._anthropic_client = build_anthropic_client(
                 new_token,
                 getattr(self, "_anthropic_base_url", None),
                 timeout=get_provider_request_timeout(self.provider, self.model),
+                passthrough_oauth=_passthrough,
             )
         except Exception as exc:
             logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
@@ -6253,11 +6287,15 @@ class AIAgent:
 
         self._anthropic_api_key = new_token
         # Update OAuth flag — token type may have changed (API key ↔ OAuth).
-        # Only treat as OAuth on native Anthropic; third-party endpoints using
-        # the Anthropic protocol must not trip OAuth paths (#1739 & third-party
-        # identity-injection guard).
+        # OAuth is honoured on native Anthropic OR when passthrough_llm_headers
+        # opts a proxy in. Other endpoints (MiniMax, Alibaba) must not trip
+        # OAuth paths (#1739 & third-party identity-injection guard).
         from agent.anthropic_adapter import _is_oauth_token
-        self._is_anthropic_oauth = _is_oauth_token(new_token) if self.provider == "anthropic" else False
+        self._is_anthropic_oauth = (
+            _is_oauth_token(new_token)
+            if (self.provider == "anthropic" or _passthrough)
+            else False
+        )
         return True
 
     def _apply_client_headers_for_base_url(self, base_url: str) -> None:
@@ -6309,13 +6347,19 @@ class AIAgent:
             except Exception:
                 pass
 
+            _passthrough = bool(getattr(self, "_passthrough_llm_headers", False))
             self._anthropic_api_key = runtime_key
             self._anthropic_base_url = runtime_base
             self._anthropic_client = build_anthropic_client(
                 runtime_key, runtime_base,
                 timeout=get_provider_request_timeout(self.provider, self.model),
+                passthrough_oauth=_passthrough,
             )
-            self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
+            self._is_anthropic_oauth = (
+                _is_oauth_token(runtime_key)
+                if (self.provider == "anthropic" or _passthrough)
+                else False
+            )
             self.api_key = runtime_key
             self.base_url = runtime_base
             return
@@ -6444,6 +6488,7 @@ class AIAgent:
         rebuilt client carries the reduced beta set.
         """
         _drop_1m = bool(getattr(self, "_oauth_1m_beta_disabled", False))
+        _passthrough = bool(getattr(self, "_passthrough_llm_headers", False))
         if getattr(self, "provider", None) == "bedrock":
             from agent.anthropic_adapter import build_anthropic_bedrock_client
             region = getattr(self, "_bedrock_region", "us-east-1") or "us-east-1"
@@ -6455,6 +6500,7 @@ class AIAgent:
                 getattr(self, "_anthropic_base_url", None),
                 timeout=get_provider_request_timeout(self.provider, self.model),
                 drop_context_1m_beta=_drop_1m,
+                passthrough_oauth=_passthrough,
             )
 
     def _interruptible_api_call(self, api_kwargs: dict):
@@ -7740,15 +7786,28 @@ class AIAgent:
 
             if fb_api_mode == "anthropic_messages":
                 # Build native Anthropic client instead of using OpenAI client
-                from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token, _is_oauth_token
+                from agent.anthropic_adapter import (
+                    build_anthropic_client,
+                    resolve_anthropic_token,
+                    _is_oauth_token,
+                    resolve_passthrough_llm_headers,
+                )
                 effective_key = (fb_client.api_key or resolve_anthropic_token() or "") if fb_provider == "anthropic" else (fb_client.api_key or "")
                 self.api_key = effective_key
                 self._anthropic_api_key = effective_key
                 self._anthropic_base_url = fb_base_url
+                _passthrough = resolve_passthrough_llm_headers(fb_provider)
+                self._passthrough_llm_headers = _passthrough
                 self._anthropic_client = build_anthropic_client(
-                    effective_key, self._anthropic_base_url, timeout=_fb_timeout,
+                    effective_key, self._anthropic_base_url,
+                    timeout=_fb_timeout,
+                    passthrough_oauth=_passthrough,
                 )
-                self._is_anthropic_oauth = _is_oauth_token(effective_key) if fb_provider == "anthropic" else False
+                self._is_anthropic_oauth = (
+                    _is_oauth_token(effective_key)
+                    if (fb_provider == "anthropic" or _passthrough)
+                    else False
+                )
                 self.client = None
                 self._client_kwargs = {}
             else:
@@ -7869,9 +7928,12 @@ class AIAgent:
                 from agent.anthropic_adapter import build_anthropic_client
                 self._anthropic_api_key = rt["anthropic_api_key"]
                 self._anthropic_base_url = rt["anthropic_base_url"]
+                _passthrough = bool(rt.get("passthrough_llm_headers", getattr(self, "_passthrough_llm_headers", False)))
+                self._passthrough_llm_headers = _passthrough
                 self._anthropic_client = build_anthropic_client(
                     rt["anthropic_api_key"], rt["anthropic_base_url"],
                     timeout=get_provider_request_timeout(self.provider, self.model),
+                    passthrough_oauth=_passthrough,
                 )
                 self._is_anthropic_oauth = rt["is_anthropic_oauth"]
                 self.client = None
@@ -7968,9 +8030,12 @@ class AIAgent:
                 from agent.anthropic_adapter import build_anthropic_client
                 self._anthropic_api_key = rt["anthropic_api_key"]
                 self._anthropic_base_url = rt["anthropic_base_url"]
+                _passthrough = bool(rt.get("passthrough_llm_headers", getattr(self, "_passthrough_llm_headers", False)))
+                self._passthrough_llm_headers = _passthrough
                 self._anthropic_client = build_anthropic_client(
                     rt["anthropic_api_key"], rt["anthropic_base_url"],
                     timeout=get_provider_request_timeout(self.provider, self.model),
+                    passthrough_oauth=_passthrough,
                 )
                 self._is_anthropic_oauth = rt["is_anthropic_oauth"]
                 self.client = None

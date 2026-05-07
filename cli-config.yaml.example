@@ -372,6 +372,65 @@ prompt_caching:
   cache_ttl: "5m" # use "1h" for long sessions with pauses between turns
 
 # =============================================================================
+# OAuth passthrough through Anthropic-compatible proxies
+# =============================================================================
+# Forward Claude Code OAuth identity (Authorization: Bearer + claude-cli
+# user-agent + OAuth betas + x-app: cli) through ANY non-anthropic.com URL.
+# Required when proxying Claude Code OAuth tokens via LiteLLM, OpenRouter
+# Anthropic-passthrough, or another transparent Anthropic-compatible router
+# that genuinely forwards OAuth headers upstream to api.anthropic.com.
+#
+# Default: false. Preserves the pre-existing safety gate against leaking
+# OAuth tokens to MiniMax / Alibaba / other third-party providers that
+# wouldn't honour them. Azure AI Foundry and AWS Bedrock are auto-excluded
+# even with the flag enabled — they technically cannot accept OAuth Bearer.
+#
+# Resolution: provider-entry wins over model-section.
+#   model.passthrough_llm_headers          — top-level default
+#   providers.<name>.passthrough_llm_headers — per named-custom-provider
+#
+# model:
+#   default: claude-opus-4-7
+#   provider: anthropic
+#   base_url: https://litellm.example.com/v1/anthropic
+#   passthrough_llm_headers: true     # forward OAuth identity to LiteLLM
+
+# providers:
+#   litellm-claude:
+#     api: https://litellm.example.com/v1/anthropic
+#     api_mode: anthropic_messages
+#     key_env: CLAUDE_CODE_OAUTH_TOKEN
+#     passthrough_llm_headers: true   # narrowest scope; overrides model.
+
+# =============================================================================
+# Anthropic protocol overrides (advanced — rarely needed)
+# =============================================================================
+# Override Anthropic beta header set, Claude Code version, or user-agent
+# template. Useful when Anthropic rotates beta names, your proxy injects
+# additional betas, or you need to spoof a different Claude Code release.
+#
+# anthropic:
+#   protocol:
+#     # Replaces the default common-betas list entirely (omit to keep defaults).
+#     common_betas:
+#       - interleaved-thinking-2025-05-14
+#       - fine-grained-tool-streaming-2025-05-14
+#       - context-1m-2025-08-07
+#     # Replaces the default OAuth-only betas list entirely.
+#     oauth_only_betas:
+#       - claude-code-20250219
+#       - oauth-2025-04-20
+#     # Additive: merged into common_betas for every request. Useful when a
+#     # proxy requires an extra beta without disturbing the default set.
+#     extend_betas: []
+#     # Override the Claude Code version Hermes spoofs in the user-agent.
+#     # Defaults to whatever `claude --version` returns, falling back to
+#     # the static value baked into agent/anthropic_adapter.py.
+#     claude_code_version: "2.1.74"
+#     # User-agent template ({version} expands to claude_code_version above).
+#     user_agent: "claude-cli/{version} (external, cli)"
+
+# =============================================================================
 # Auxiliary Models (Advanced — Experimental)
 # =============================================================================
 # Hermes uses lightweight "auxiliary" models for side tasks: image analysis,
