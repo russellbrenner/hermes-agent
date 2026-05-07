@@ -2293,6 +2293,79 @@ def browser_snapshot(
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
+# ---------------------------------------------------------------------------
+# Session cache for CDP coordinate clicks
+#
+# Target.getTargets + Target.attachToTarget cost one round-trip each and
+# their results (page targetId + session_id) are stable across clicks on
+# the same page.  We cache them keyed by CDP endpoint URL and invalidate
+# automatically when the browser reports a stale session error.
+#
+# Pattern: browser-harness daemon keeps session_id on the daemon object and
+# retries once on "Session with given id not found" to self-heal after
+# navigation or crash.  We replicate that here without a persistent daemon
+# process by storing it in a module-level dict.
+# ---------------------------------------------------------------------------
+
+_CDP_SESSION_CACHE: dict[str, str] = {}  # ws_url → cached session_id
+
+
+async def _cdp_resolve_session(
+    ws: Any,
+    ws_url: str,
+    deadline: float,
+    msg_id_ref: list,
+) -> Optional[str]:
+    """Resolve (and cache) the page-scoped CDP session ID.
+
+    Sends Target.getTargets + Target.attachToTarget on *ws* and caches the
+    resulting session_id for future clicks.  Returns None if no page target
+    is found (Input.dispatchMouseEvent will be sent at browser level, which
+    works for simple cases).
+    """
+    import asyncio as _asyncio
+
+    async def _send(method: str, params: dict, sid: Optional[str] = None) -> int:
+        msg_id_ref[0] += 1
+        call_id = msg_id_ref[0]
+        req: dict = {"id": call_id, "method": method, "params": params}
+        if sid:
+            req["sessionId"] = sid
+        await ws.send(json.dumps(req))
+        return call_id
+
+    async def _recv_until(call_id: int) -> dict:
+        while True:
+            remaining = deadline - _asyncio.get_event_loop().time()
+            if remaining <= 0:
+                raise TimeoutError(f"CDP timed out waiting for id={call_id}")
+            raw = await _asyncio.wait_for(ws.recv(), timeout=remaining)
+            msg = json.loads(raw)
+            if msg.get("id") == call_id:
+                if "error" in msg:
+                    raise RuntimeError(f"CDP error: {msg['error']}")
+                return msg.get("result", {})
+
+    gt_id = await _send("Target.getTargets", {})
+    gt_result = await _recv_until(gt_id)
+    page_target_id: Optional[str] = None
+    for t in gt_result.get("targetInfos", []):
+        if t.get("type") == "page" and t.get("attached", True):
+            page_target_id = t["targetId"]
+            break
+
+    if not page_target_id:
+        return None
+
+    at_id = await _send("Target.attachToTarget",
+                        {"targetId": page_target_id, "flatten": True})
+    at_result = await _recv_until(at_id)
+    session_id = at_result.get("sessionId") or None
+    if session_id:
+        _CDP_SESSION_CACHE[ws_url] = session_id
+    return session_id
+
+
 async def _cdp_coordinate_click_async(
     ws_url: str,
     x: int,
@@ -2302,19 +2375,25 @@ async def _cdp_coordinate_click_async(
 ) -> None:
     """Perform a compositor-level click on a single persistent WS connection.
 
-    Opens the WebSocket once, then sends all required CDP messages on it:
-      1. Target.getTargets  — find the active page target
-      2. Target.attachToTarget (optional) — get a sessionId for page-scope input
-      3. Input.dispatchMouseEvent (mousePressed)
-      4. Input.dispatchMouseEvent (mouseReleased)
+    Optimizations vs the naïve 3-separate-connections approach:
 
-    This is 3–4 messages over one connection vs the previous approach of
-    3 separate connections (one per call), saving 2 TCP+WS handshakes per click.
-    mousePressed and mouseReleased are pipelined — both sent before either
-    response is awaited — so they travel in the same network burst.
+    1. **Single connection** — one TCP+WS handshake for the entire click.
+       All CDP messages are sent on the same socket.
+
+    2. **Session ID caching** — Target.getTargets + Target.attachToTarget are
+       only paid once per CDP endpoint.  Subsequent clicks skip straight to
+       the two mouse events.  Cache is invalidated automatically on stale-
+       session errors and re-resolved once (browser-harness self-heal pattern).
+
+    3. **mouseReleased-only wait** — mousePressed and mouseReleased are both
+       fired before awaiting either response.  Because the browser processes
+       CDP messages sequentially within a session, if mouseReleased is
+       acknowledged then mousePressed has already been processed.  We only
+       wait for the release ack (Playwright / Puppeteer pattern), saving one
+       RTT on the common path.
     """
     import asyncio as _asyncio
-    from tools.browser_cdp_tool import websockets as _ws  # already imported at module level
+    from tools.browser_cdp_tool import websockets as _ws
 
     async with _ws.connect(
         ws_url,
@@ -2322,20 +2401,25 @@ async def _cdp_coordinate_click_async(
         open_timeout=timeout,
         close_timeout=5,
         ping_interval=None,
+        compression=None,       # small CDP messages don't benefit from compression
     ) as ws:
         deadline = _asyncio.get_event_loop().time() + timeout
-        msg_id = 0
+        msg_id_ref = [0]        # mutable so nested helpers can increment
 
         def _next_id() -> int:
-            nonlocal msg_id
-            msg_id += 1
-            return msg_id
+            msg_id_ref[0] += 1
+            return msg_id_ref[0]
 
-        async def _send(method: str, params: dict, session_id: Optional[str] = None) -> int:
+        async def _send_mouse(event_type: str, sid: Optional[str]) -> int:
             call_id = _next_id()
-            req = {"id": call_id, "method": method, "params": params}
-            if session_id:
-                req["sessionId"] = session_id
+            req: dict = {
+                "id": call_id,
+                "method": "Input.dispatchMouseEvent",
+                "params": {"type": event_type, "x": x, "y": y,
+                           "button": button, "clickCount": 1},
+            }
+            if sid:
+                req["sessionId"] = sid
             await ws.send(json.dumps(req))
             return call_id
 
@@ -2350,35 +2434,29 @@ async def _cdp_coordinate_click_async(
                     if "error" in msg:
                         raise RuntimeError(f"CDP error: {msg['error']}")
                     return msg.get("result", {})
-                # ignore events and unrelated responses
 
-        # 1. Target.getTargets — find page target
-        gt_id = await _send("Target.getTargets", {})
-        gt_result = await _recv_until(gt_id)
-        page_target_id: Optional[str] = None
-        for t in gt_result.get("targetInfos", []):
-            if t.get("type") == "page" and t.get("attached", True):
-                page_target_id = t["targetId"]
-                break
+        # --- resolve session (cached after first click) ---
+        session_id: Optional[str] = _CDP_SESSION_CACHE.get(ws_url)
+        if not session_id:
+            session_id = await _cdp_resolve_session(ws, ws_url, deadline, msg_id_ref)
 
-        # 2. Target.attachToTarget — get a session scoped to the page
-        #    (so Input.dispatchMouseEvent reaches the renderer, not browser-level)
-        session_id: Optional[str] = None
-        if page_target_id:
-            at_id = await _send("Target.attachToTarget",
-                                {"targetId": page_target_id, "flatten": True})
-            at_result = await _recv_until(at_id)
-            session_id = at_result.get("sessionId")
-
-        mouse_params = {"x": x, "y": y, "button": button, "clickCount": 1}
-
-        # 3+4. mousePressed + mouseReleased — pipeline both before awaiting either
-        press_id = await _send("Input.dispatchMouseEvent",
-                               {**mouse_params, "type": "mousePressed"}, session_id)
-        release_id = await _send("Input.dispatchMouseEvent",
-                                 {**mouse_params, "type": "mouseReleased"}, session_id)
-        await _recv_until(press_id)
-        await _recv_until(release_id)
+        # --- fire mousePressed + mouseReleased without awaiting press ack ---
+        # Both messages are sent before we await either response.  The browser
+        # processes them in order, so waiting only for mouseReleased is enough.
+        press_id = await _send_mouse("mousePressed", session_id)
+        release_id = await _send_mouse("mouseReleased", session_id)
+        try:
+            await _recv_until(release_id)
+        except RuntimeError as exc:
+            # Stale session (e.g. after navigation) — invalidate cache, retry once
+            if "Session with given id not found" in str(exc) and session_id:
+                _CDP_SESSION_CACHE.pop(ws_url, None)
+                session_id = await _cdp_resolve_session(ws, ws_url, deadline, msg_id_ref)
+                press_id = await _send_mouse("mousePressed", session_id)
+                release_id = await _send_mouse("mouseReleased", session_id)
+                await _recv_until(release_id)
+            else:
+                raise
 
 
 def _cdp_coordinate_click(

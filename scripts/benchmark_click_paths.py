@@ -161,12 +161,27 @@ def run_benchmark(iterations: int = 300, warmup: int = 20) -> None:
     print(f"        Done — {base_err} errors, mean={base_stats['mean_ms']:.2f}ms")
 
     # -----------------------------------------------------------------------
-    # 2. Optimized: single-connection (this PR)
+    # 2. Optimized: single-connection — first-click cost (cold cache)
     # -----------------------------------------------------------------------
-    print(f"\n  [2/3] Optimized (this PR — 1 WS connection, pipelined mouse events)")
-    print(f"        Warmup {warmup}, then {iterations} iterations...")
+    print(f"\n  [2/3] Optimized — cold cache (1 WS conn, includes getTargets+attachToTarget)")
+    print(f"        {iterations} iterations, cache cleared before each...")
+
+    def _cold_click():
+        bt._CDP_SESSION_CACHE.clear()
+        return bt.browser_click(x=150.0, y=200.0, task_id="bench")
 
     cdp_mod._resolve_cdp_endpoint = lambda: LIGHTPANDA_WS
+    cold_times, cold_err = _bench(_cold_click, warmup=0, n=iterations)
+    cold_stats = _stats(cold_times)
+    print(f"        Done — {cold_err} errors, mean={cold_stats['mean_ms']:.2f}ms")
+
+    # -----------------------------------------------------------------------
+    # 3. Optimized: warm cache (session cached from previous click)
+    # -----------------------------------------------------------------------
+    print(f"\n  [3/3] Optimized — warm cache (1 WS conn, skips getTargets+attachToTarget)")
+    print(f"        Warmup {warmup} (fills cache), then {iterations} iterations...")
+
+    bt._CDP_SESSION_CACHE.clear()
     opt_times, opt_err = _bench(
         lambda: bt.browser_click(x=150.0, y=200.0, task_id="bench"),
         warmup, iterations,
@@ -176,12 +191,10 @@ def run_benchmark(iterations: int = 300, warmup: int = 20) -> None:
     print(f"        Done — {opt_err} errors, mean={opt_stats['mean_ms']:.2f}ms")
 
     # -----------------------------------------------------------------------
-    # 3. agent-browser HTTP IPC reference (what a ref click costs)
+    # 4. agent-browser HTTP IPC reference (what a ref click costs)
     # -----------------------------------------------------------------------
     if ab_ok:
-        print(f"\n  [3/3] agent-browser HTTP IPC (reference for ref-click latency)")
-        print(f"        Warmup {warmup}, then {iterations} iterations...")
-
+        print(f"\n  [ref] agent-browser HTTP IPC (reference for ref-click latency)")
         ab_times = []
         for _ in range(warmup):
             urllib.request.urlopen(f"http://127.0.0.1:{AGENT_BROWSER_PORT}/api/sessions", timeout=5).read()
@@ -199,34 +212,30 @@ def run_benchmark(iterations: int = 300, warmup: int = 20) -> None:
     print(f"\n{'─' * 78}")
     print(f"  {'Approach':<46}  {'Mean':>{col_w}}  {'Median':>{col_w}}  {'Min':>{col_w}}  {'p95':>{col_w}}  {'Max':>{col_w}}")
     print(f"{'─' * 78}")
-    _row("Baseline  (3 connections, sequential)", base_stats, col_w)
-    _row("Optimized (1 connection, pipelined)  ", opt_stats,  col_w)
+    _row("Baseline  (3 WS connections, sequential)     ", base_stats, col_w)
+    _row("Optimized — cold cache (1 conn + negotiate)  ", cold_stats, col_w)
+    _row("Optimized — warm cache (1 conn, skip resolve)", opt_stats,  col_w)
     if ab_ok:
-        _row("Ref-click IPC baseline (1 HTTP req)  ", ab_stats,  col_w)
+        _row("Ref-click IPC baseline (1 HTTP req)          ", ab_stats,  col_w)
     print(f"{'─' * 78}")
 
-    speedup = base_stats["mean_ms"] / opt_stats["mean_ms"]
-    saved_ms = base_stats["mean_ms"] - opt_stats["mean_ms"]
-    print(f"\n  Results:")
-    print(f"    Speedup (mean):     {speedup:.2f}x  ({saved_ms:.2f} ms saved per click)")
-    print(f"    Speedup (median):   {base_stats['median_ms'] / opt_stats['median_ms']:.2f}x")
-    print(f"    Speedup (p95):      {base_stats['p95_ms'] / opt_stats['p95_ms']:.2f}x")
+    print(f"\n  Speedups (mean vs baseline):")
+    print(f"    Cold cache:  {base_stats['mean_ms'] / cold_stats['mean_ms']:.2f}x  ({base_stats['mean_ms'] - cold_stats['mean_ms']:.2f} ms saved)")
+    print(f"    Warm cache:  {base_stats['mean_ms'] / opt_stats['mean_ms']:.2f}x  ({base_stats['mean_ms'] - opt_stats['mean_ms']:.2f} ms saved)")
+    saved_by_cache = cold_stats['mean_ms'] - opt_stats['mean_ms']
+    print(f"    Cache saves: {saved_by_cache:.2f} ms/click (Target.getTargets + Target.attachToTarget skipped)")
 
     if ab_ok:
         cdp_vs_ref = opt_stats["mean_ms"] / ab_stats["mean_ms"]
-        print(f"\n    Optimized CDP vs ref-click: {cdp_vs_ref:.1f}x  "
-              f"(+{opt_stats['mean_ms'] - ab_stats['mean_ms']:.2f} ms over ref)")
-        print(f"    For scenarios where ref-click works, it's still faster.")
-        print(f"    For cross-origin iframes/shadow DOM/canvas, coordinate click")
-        print(f"    is the only option — {opt_stats['mean_ms']:.1f}ms is the cost.")
+        print(f"\n    Warm-cached CDP vs ref-click: {cdp_vs_ref:.1f}x  (+{opt_stats['mean_ms'] - ab_stats['mean_ms']:.2f} ms)")
+        print(f"    Remaining gap = cost of 1 WS connection open.")
 
-    print(f"\n  Why the optimized approach is faster:")
-    print(f"    • Baseline: 3 sequential websocket.connect() calls")
-    print(f"      Each = TCP handshake + WS upgrade + message + close")
-    print(f"    • Optimized: 1 connect, then 4 messages in sequence")
-    print(f"      mousePressed + mouseReleased are pipelined (sent before")
-    print(f"      awaiting either response) — they travel in the same burst.")
-    print(f"    • Savings come entirely from eliminating 2 WS handshakes.")
+    print(f"\n  Summary of optimizations in this PR:")
+    print(f"    1. Single WS connection   — eliminates 2 TCP+WS handshakes per click")
+    print(f"    2. mouseReleased-only wait — skips 1 RTT (press ack redundant per Playwright)")
+    print(f"    3. Session ID cache       — eliminates getTargets+attachToTarget on repeat clicks")
+    print(f"    4. compression=None       — no compression overhead on small CDP messages")
+    print(f"    (Browser-harness, Playwright, and Puppeteer all use variations of these same patterns)")
     print()
 
 

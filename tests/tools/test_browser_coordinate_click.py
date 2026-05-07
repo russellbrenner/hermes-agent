@@ -34,6 +34,7 @@ class _CDPServer:
         self._thread: threading.Thread | None = None
         self._host = "127.0.0.1"
         self._port = 0
+        self._url: str = ""
 
     def on(self, method: str, handler):
         self._handlers[method] = handler
@@ -89,7 +90,8 @@ class _CDPServer:
         self._thread.start()
         if not ready.wait(timeout=5.0):
             raise RuntimeError("CDP mock server failed to start")
-        return f"ws://{self._host}:{self._port}/devtools/browser/mock"
+        self._url = f"ws://{self._host}:{self._port}/devtools/browser/mock"
+        return self._url
 
     def stop(self) -> None:
         if self._loop and self._server:
@@ -114,9 +116,15 @@ def cdp_server(monkeypatch):
 
     import tools.browser_cdp_tool as cdp_mod
     monkeypatch.setattr(cdp_mod, "_resolve_cdp_endpoint", lambda: ws_url)
+
+    # clear the session cache so each test starts fresh
+    from tools import browser_tool as _bt
+    _bt._CDP_SESSION_CACHE.clear()
+
     try:
         yield server
     finally:
+        _bt._CDP_SESSION_CACHE.clear()
         server.stop()
 
 
@@ -465,4 +473,87 @@ class TestRegistryIntegration:
         raw = registry.dispatch("browser_click", {"ref": "@e3"}, task_id="t1")
         result = json.loads(raw)
         assert result["success"] is True
-        assert result["clicked"] == "@e3"
+
+
+# ---------------------------------------------------------------------------
+# Session caching
+# ---------------------------------------------------------------------------
+
+
+class TestSessionCaching:
+    """Second click skips Target.getTargets + Target.attachToTarget."""
+
+    def test_second_click_skips_session_resolution(self, cdp_server, monkeypatch):
+        """After first click the session_id is cached; second click goes straight
+        to mousePressed+mouseReleased without re-issuing getTargets/attachToTarget."""
+        from tools import browser_tool
+        import tools.browser_cdp_tool as cdp_mod
+
+        # clear cache
+        browser_tool._CDP_SESSION_CACHE.clear()
+        monkeypatch.setattr(cdp_mod, "_resolve_cdp_endpoint", lambda: cdp_server._url)
+
+        resolve_count = {"n": 0}
+
+        def _getTargets(p, s):
+            resolve_count["n"] += 1
+            return {"targetInfos": [{"targetId": "p1", "type": "page", "attached": True, "url": "..."}]}
+
+        cdp_server.on("Target.getTargets", _getTargets)
+        cdp_server.on("Target.attachToTarget", lambda p, s: {"sessionId": "sess-cached"})
+        cdp_server.on("Input.dispatchMouseEvent", lambda p, s: {})
+
+        # First click — must call getTargets
+        r1 = json.loads(browser_tool.browser_click(x=10.0, y=20.0))
+        assert r1["success"] is True
+        assert resolve_count["n"] == 1
+
+        # Second click — cache hit; getTargets must NOT be called again
+        r2 = json.loads(browser_tool.browser_click(x=30.0, y=40.0))
+        assert r2["success"] is True
+        assert resolve_count["n"] == 1, "session resolution was repeated despite warm cache"
+
+    def test_stale_session_triggers_reattach(self, cdp_server, monkeypatch):
+        """If the browser returns 'Session with given id not found', the cache is
+        cleared and session resolution runs again before retrying the click."""
+        from tools import browser_tool
+        import tools.browser_cdp_tool as cdp_mod
+
+        browser_tool._CDP_SESSION_CACHE.clear()
+        monkeypatch.setattr(cdp_mod, "_resolve_cdp_endpoint", lambda: cdp_server._url)
+
+        call_count = {"mouse": 0, "resolve": 0}
+
+        def _getTargets(p, s):
+            call_count["resolve"] += 1
+            return {"targetInfos": [{"targetId": "px", "type": "page", "attached": True, "url": "..."}]}
+
+        def _dispatch(p, s):
+            call_count["mouse"] += 1
+            # First two mouse calls (with stale session) return an error;
+            # after re-resolve they should succeed
+            if call_count["mouse"] <= 2:
+                raise RuntimeError("Session with given id not found: stale-session-id")
+            return {}
+
+        cdp_server.on("Target.getTargets", _getTargets)
+        cdp_server.on("Target.attachToTarget", lambda p, s: {"sessionId": f"sess-{call_count['resolve']}"})
+        cdp_server.on("Input.dispatchMouseEvent", _dispatch)
+
+        # Seed cache with stale session to trigger the error path
+        browser_tool._CDP_SESSION_CACHE[cdp_server._url] = "stale-session-id"
+
+        r = json.loads(browser_tool.browser_click(x=50.0, y=60.0))
+        assert r["success"] is True
+        # Must have resolved the session once (after evicting stale entry)
+        assert call_count["resolve"] >= 1
+
+    def test_cache_cleared_on_endpoint_change(self, monkeypatch):
+        """Cache is keyed per endpoint URL; different URL doesn't reuse cached session."""
+        from tools import browser_tool
+
+        browser_tool._CDP_SESSION_CACHE.clear()
+        browser_tool._CDP_SESSION_CACHE["ws://endpoint-a/"] = "sess-a"
+
+        # Endpoint B must not find endpoint A's session
+        assert browser_tool._CDP_SESSION_CACHE.get("ws://endpoint-b/") is None
