@@ -74,9 +74,10 @@ class _Mem0OssClient:
     """Small client for the open-source mem0 FastAPI server.
 
     The mem0ai Python ``MemoryClient`` targets the hosted Platform API
-    (``/v1/ping/`` and ``/v3/memories/...``). The OSS server deployed in the
-    homelab exposes ``/memories`` and ``/search`` instead, so keep this adapter
-    deliberately narrow and match the methods used by the Hermes provider.
+    (``/v1/ping/`` and ``/v3/memories/...``). Self-hosted OSS FastAPI
+    deployments expose ``/memories`` and ``/search`` instead, so keep this
+    adapter deliberately narrow and aligned with the methods used by the
+    Hermes provider.
     """
 
     def __init__(self, *, host: str, api_key: str):
