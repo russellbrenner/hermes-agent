@@ -26,8 +26,8 @@
     "unicode-animations": "^1.0.3"
   },
   "devDependencies": {
-    "@babel/cli": "^7.28.6",
-    "@babel/core": "^7.29.0",
+    "@babel/cli": "^8.0.4",
+    "@babel/core": "^7.29.6",
     "@babel/plugin-syntax-jsx": "^7.28.6",
     "@eslint/js": "^9",
     "@types/node": "^25.5.0",
