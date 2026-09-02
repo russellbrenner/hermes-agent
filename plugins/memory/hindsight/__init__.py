@@ -2237,11 +2237,36 @@ class HindsightMemoryProvider(MemoryProvider):
                 # aretain_batch takes bank_id/retain_async as call args, not item keys.
                 item.pop("bank_id", None)
                 item.pop("retain_async", None)
-                logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
-                             self._bank_id, len(content), context)
-                self._run_hindsight_operation(
-                    lambda client: client.aretain_batch(bank_id=self._bank_id, items=[item])
-                )
+                bank_id = self._bank_id
+                retain_async_flag = self._retain_async
+                logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s, async=%s",
+                             bank_id, len(content), context, retain_async_flag)
+
+                def _do_retain() -> None:
+                    resp = self._run_hindsight_operation(
+                        lambda client: client.aretain_batch(
+                            bank_id=bank_id,
+                            items=[item],
+                            retain_async=retain_async_flag,
+                        )
+                    )
+                    if retain_async_flag:
+                        self._track_retain_ops(resp, bank_id)
+
+                if retain_async_flag:
+                    # Same path as sync_turn: hand the write to the serial
+                    # writer thread and return. Server-side extraction can
+                    # take minutes under load; blocking the tool call on it
+                    # trips the client timeout even though the retain lands
+                    # (#61442). FIFO on the writer also keeps a tool retain
+                    # from racing a still-queued turn retain.
+                    self._ensure_writer()
+                    self._register_atexit()
+                    self._retain_queue.put(_do_retain)
+                    logger.debug("Tool hindsight_retain: queued")
+                    return json.dumps({"result": "Memory queued for storage."})
+
+                _do_retain()
                 logger.debug("Tool hindsight_retain: success")
                 return json.dumps({"result": "Memory stored successfully."})
             except Exception as e:
