@@ -196,6 +196,21 @@ class TestMattermostSend:
 
 
     @pytest.mark.asyncio
+    async def test_typing_indicator_stays_in_the_active_thread(self):
+        """Mattermost typing events must include the thread parent_id."""
+        self.adapter._api_post = AsyncMock(return_value={})
+
+        await self.adapter.send_typing(
+            "channel_1",
+            metadata={"thread_id": "root_post"},
+        )
+
+        self.adapter._api_post.assert_awaited_once_with(
+            "users//typing",
+            {"channel_id": "channel_1", "parent_id": "root_post"},
+        )
+
+    @pytest.mark.asyncio
     async def test_progress_send_with_invalid_thread_root_never_falls_back_flat(self):
         """Tool/status/progress bubbles must stay quiet when the thread is broken."""
         self.adapter._reply_mode = "thread"
@@ -359,12 +374,13 @@ class TestMattermostMentionBehavior:
         self.adapter._bot_username = "hermes-bot"
         self.adapter.handle_message = AsyncMock()
 
-    def _make_event(self, message, channel_type="O", channel_id="chan_456"):
+    def _make_event(self, message, channel_type="O", channel_id="chan_456", root_id=""):
         post_data = {
             "id": "post_mention",
             "user_id": "user_123",
             "channel_id": channel_id,
             "message": message,
+            "root_id": root_id,
         }
         return {
             "event": "posted",
@@ -392,6 +408,80 @@ class TestMattermostMentionBehavior:
             os.environ.pop("MATTERMOST_REQUIRE_MENTION", None)
             await self.adapter._handle_ws_event(self._make_event("hello", channel_id="chan_456"))
             assert self.adapter.handle_message.called
+
+    @pytest.mark.asyncio
+    async def test_active_thread_continues_without_repeated_mention(self):
+        """A prior bot reply activates mention-free continuation in that thread."""
+        self.adapter._api_get = AsyncMock(return_value={
+            "order": ["root_post", "bot_reply", "post_mention"],
+            "posts": {
+                "root_post": {
+                    "id": "root_post",
+                    "user_id": "user_123",
+                    "message": "@hermes-bot investigate this",
+                },
+                "bot_reply": {
+                    "id": "bot_reply",
+                    "user_id": "bot_user_id",
+                    "message": "I am checking it.",
+                    "root_id": "root_post",
+                },
+                "post_mention": {
+                    "id": "post_mention",
+                    "user_id": "user_123",
+                    "message": "any update?",
+                    "root_id": "root_post",
+                },
+            },
+        })
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MATTERMOST_REQUIRE_MENTION", None)
+            os.environ.pop("MATTERMOST_FREE_RESPONSE_CHANNELS", None)
+            await self.adapter._handle_ws_event(
+                self._make_event("any update?", root_id="root_post")
+            )
+
+        assert self.adapter.handle_message.called
+        msg_event = self.adapter.handle_message.call_args[0][0]
+        assert msg_event.source.thread_id == "root_post"
+
+    @pytest.mark.asyncio
+    async def test_first_mention_in_existing_thread_backfills_prior_context(self):
+        """The first addressed message receives earlier thread text as context."""
+        self.adapter._api_get = AsyncMock(return_value={
+            "order": ["root_post", "prior_reply", "post_mention"],
+            "posts": {
+                "root_post": {
+                    "id": "root_post",
+                    "user_id": "user_123",
+                    "message": "The switch uplink is flapping.",
+                },
+                "prior_reply": {
+                    "id": "prior_reply",
+                    "user_id": "user_456",
+                    "message": "I replaced the short patch lead.",
+                    "root_id": "root_post",
+                },
+                "post_mention": {
+                    "id": "post_mention",
+                    "user_id": "user_123",
+                    "message": "@hermes-bot check it now",
+                    "root_id": "root_post",
+                },
+            },
+        })
+
+        await self.adapter._handle_ws_event(
+            self._make_event("@hermes-bot check it now", root_id="root_post")
+        )
+
+        msg_event = self.adapter.handle_message.call_args[0][0]
+        assert "The switch uplink is flapping." in msg_event.channel_context
+        assert "I replaced the short patch lead." in msg_event.channel_context
+        assert "check it now" not in msg_event.channel_context
+        assert msg_event.reply_to_message_id == "root_post"
+        assert msg_event.reply_to_text == "The switch uplink is flapping."
 
 
 # ---------------------------------------------------------------------------

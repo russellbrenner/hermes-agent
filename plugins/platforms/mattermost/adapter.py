@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import secrets
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -111,6 +112,86 @@ def validate_mattermost_config(config: PlatformConfig) -> bool:
     return True
 
 
+class _MattermostCommandHub:
+    """One Mattermost custom-command listener shared by all profiles."""
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self.adapters: List[Any] = []
+        self.runner: Any = None
+        self.site: Any = None
+        self._start_lock = asyncio.Lock()
+
+    def register(self, adapter: Any) -> None:
+        if adapter not in self.adapters:
+            self.adapters.append(adapter)
+
+    async def start(self) -> None:
+        if self.runner is not None:
+            return
+        async with self._start_lock:
+            if self.runner is not None:
+                return
+            from aiohttp import web
+
+            app = web.Application(client_max_size=128 * 1024)
+            app.router.add_post("/hermes-command", self.handle_command)
+            app.router.add_get("/health", self.handle_health)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, self.host, self.port)
+            try:
+                await site.start()
+            except Exception:
+                await runner.cleanup()
+                raise
+            self.runner = runner
+            self.site = site
+
+    async def unregister(self, adapter: Any) -> bool:
+        """Remove an adapter and stop the listener when the hub is empty."""
+        async with self._start_lock:
+            if adapter in self.adapters:
+                self.adapters.remove(adapter)
+            if self.adapters:
+                return False
+            runner, self.runner = self.runner, None
+            self.site = None
+            if runner is not None:
+                await runner.cleanup()
+            return True
+
+    async def handle_health(self, _request: Any) -> Any:
+        from aiohttp import web
+
+        return web.Response(text="ok")
+
+    async def handle_command(self, request: Any) -> Any:
+        import hmac
+        from aiohttp import web
+
+        supplied = str(request.headers.get("Authorization") or "").strip()
+        if supplied.lower().startswith("token "):
+            supplied = supplied[6:].strip()
+        elif supplied.lower().startswith("bearer "):
+            supplied = supplied[7:].strip()
+        for adapter in tuple(self.adapters):
+            expected = str(getattr(adapter, "_command_token", "") or "")
+            if expected and hmac.compare_digest(supplied, expected):
+                return await adapter._handle_command_request(request)
+        return web.json_response(
+            {
+                "response_type": "ephemeral",
+                "text": "Hermes command authentication failed.",
+            },
+            status=403,
+        )
+
+
+_COMMAND_HUBS: Dict[Tuple[str, int], _MattermostCommandHub] = {}
+
+
 class MattermostAdapter(BasePlatformAdapter):
     """Gateway adapter for Mattermost (self-hosted or cloud)."""
 
@@ -146,6 +227,28 @@ class MattermostAdapter(BasePlatformAdapter):
 
         # Dedup cache (prevent reprocessing)
         self._dedup = MessageDeduplicator()
+
+        # Bind the Mattermost custom-command credential while this adapter's
+        # profile secret scope is active. Callback requests run in independent
+        # aiohttp tasks and must not read another profile's environment.
+        self._command_token = str(
+            _get_scoped_secret("MATTERMOST_COMMAND_TOKEN", "") or ""
+        ).strip()
+        self._command_tasks: set[asyncio.Task] = set()
+        self._command_host = str(
+            config.extra.get("callback_host")
+            or os.getenv("MATTERMOST_CALLBACK_HOST")
+            or "127.0.0.1"
+        )
+        try:
+            self._command_port = int(
+                config.extra.get("callback_port")
+                or os.getenv("MATTERMOST_CALLBACK_PORT")
+                or 18065
+            )
+        except (TypeError, ValueError):
+            self._command_port = 18065
+        self._command_hub: Optional[_MattermostCommandHub] = None
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -308,6 +411,34 @@ class MattermostAdapter(BasePlatformAdapter):
     # Required overrides
     # ------------------------------------------------------------------
 
+    async def _start_command_server(self) -> None:
+        if not self._command_token:
+            return
+        key = (self._command_host, self._command_port)
+        hub = _COMMAND_HUBS.get(key)
+        if hub is None:
+            hub = _MattermostCommandHub(*key)
+            _COMMAND_HUBS[key] = hub
+        hub.register(self)
+        try:
+            await hub.start()
+        except Exception:
+            if self in hub.adapters:
+                hub.adapters.remove(self)
+            if not hub.adapters:
+                _COMMAND_HUBS.pop(key, None)
+            raise
+        self._command_hub = hub
+
+    async def _stop_command_server(self) -> None:
+        hub = self._command_hub
+        self._command_hub = None
+        if hub is None:
+            return
+        stopped = await hub.unregister(self)
+        if stopped:
+            _COMMAND_HUBS.pop((hub.host, hub.port), None)
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Mattermost and start the WebSocket listener."""
         import aiohttp
@@ -343,6 +474,21 @@ class MattermostAdapter(BasePlatformAdapter):
         self._mark_connected()
         # Plugin-registered native handlers (ctx.register_platform_handler).
         self._wire_plugin_handlers(None)
+        try:
+            await self._start_command_server()
+            if self._command_hub is not None:
+                logger.info(
+                    "Mattermost: command listener on %s:%d",
+                    self._command_host,
+                    self._command_port,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Mattermost: could not start command listener (%s); "
+                "the /hermes custom command is disabled.",
+                exc,
+            )
+            self._command_hub = None
         return True
 
     async def disconnect(self) -> None:
@@ -366,7 +512,185 @@ class MattermostAdapter(BasePlatformAdapter):
         if self._session and not self._session.closed:
             await self._session.close()
 
+        try:
+            await self._stop_command_server()
+        except Exception:
+            logger.debug("Mattermost: command listener cleanup failed", exc_info=True)
+
         logger.info("Mattermost: disconnected")
+
+    async def _handle_command_request(self, request: Any) -> Any:
+        """Route one global ``/hermes <target> <text>`` Mattermost command."""
+        import hmac
+        from aiohttp import web
+
+        supplied = str(request.headers.get("Authorization") or "").strip()
+        if supplied.lower().startswith("token "):
+            supplied = supplied[6:].strip()
+        elif supplied.lower().startswith("bearer "):
+            supplied = supplied[7:].strip()
+        if not self._command_token or not hmac.compare_digest(
+            supplied, self._command_token
+        ):
+            return web.json_response(
+                {
+                    "response_type": "ephemeral",
+                    "text": "Hermes command authentication failed.",
+                },
+                status=403,
+            )
+
+        try:
+            form = await request.post()
+        except Exception:
+            return web.json_response(
+                {
+                    "response_type": "ephemeral",
+                    "text": "Malformed Mattermost command payload.",
+                },
+                status=400,
+            )
+
+        raw_text = str(form.get("text") or "").strip()
+        target_token, separator, remainder = raw_text.partition(" ")
+        target_token = target_token.strip().lstrip("@").lower()
+        remainder = remainder.strip() if separator else ""
+
+        runner = getattr(self, "gateway_runner", None)
+        targets: Dict[str, str] = {}
+        target_adapters: Dict[str, "MattermostAdapter"] = {}
+        active_name_fn = getattr(runner, "_active_profile_name", None)
+        active_profile = (
+            str(active_name_fn() or "default").strip()
+            if callable(active_name_fn)
+            else str(getattr(self, "_owner_profile", "") or "default").strip()
+        )
+        primary_map = getattr(runner, "adapters", None)
+        primary_adapter = (
+            primary_map.get(Platform.MATTERMOST)
+            if isinstance(primary_map, dict)
+            else self
+        )
+        if not isinstance(primary_adapter, MattermostAdapter):
+            primary_adapter = self
+        targets[active_profile.lower()] = active_profile
+        target_adapters[active_profile] = primary_adapter
+        primary_bot = str(
+            getattr(primary_adapter, "_bot_username", "") or ""
+        ).strip()
+        if primary_bot:
+            targets[primary_bot.lower()] = active_profile
+
+        profile_adapters = getattr(runner, "_profile_adapters", None)
+        if isinstance(profile_adapters, dict):
+            for profile_name, adapters in profile_adapters.items():
+                profile = str(profile_name or "").strip()
+                if not profile or not isinstance(adapters, dict):
+                    continue
+                target_adapter = adapters.get(Platform.MATTERMOST)
+                if not isinstance(target_adapter, MattermostAdapter):
+                    continue
+                targets[profile.lower()] = profile
+                target_adapters[profile] = target_adapter
+                bot_name = str(
+                    getattr(target_adapter, "_bot_username", "") or ""
+                ).strip()
+                if bot_name:
+                    targets[bot_name.lower()] = profile
+
+        target_profile = targets.get(target_token)
+        if not target_profile:
+            choices = ", ".join(sorted(set(targets.values()))) or "none"
+            return web.json_response(
+                {
+                    "response_type": "ephemeral",
+                    "text": (
+                        f"Unknown Hermes target `{target_token or '(missing)'}`. "
+                        f"Available profiles: {choices}.\n"
+                        "Usage: `/hermes <profile-or-bot> <command-or-prompt>`"
+                    ),
+                }
+            )
+
+        if not remainder:
+            remainder = "/help"
+        elif not remainder.startswith("/"):
+            first, space, rest = remainder.partition(" ")
+            from hermes_cli.commands import resolve_command, slack_subcommand_map
+
+            command = slack_subcommand_map().get(first.lower())
+            if command is None and resolve_command(first) is not None:
+                command = f"/{first.lower().lstrip('/')}"
+            if command:
+                remainder = command + (f" {rest}" if space and rest else "")
+
+        channel_id = str(form.get("channel_id") or "").strip()
+        user_id = str(form.get("user_id") or "").strip()
+        user_name = str(form.get("user_name") or user_id).strip()
+        if not channel_id or not user_id:
+            return web.json_response(
+                {
+                    "response_type": "ephemeral",
+                    "text": "Mattermost omitted channel_id or user_id.",
+                },
+                status=400,
+            )
+
+        dispatch_adapter = target_adapters.get(target_profile)
+        if dispatch_adapter is None:
+            return web.json_response(
+                {
+                    "response_type": "ephemeral",
+                    "text": "Target Hermes adapter is unavailable.",
+                },
+                status=503,
+            )
+
+        source = dispatch_adapter.build_source(
+            chat_id=channel_id,
+            chat_name=str(form.get("channel_name") or channel_id),
+            chat_type="group",
+            user_id=user_id,
+            user_name=user_name,
+            message_id=str(form.get("trigger_id") or secrets.token_urlsafe(12)),
+        )
+        source.profile = target_profile
+        event = MessageEvent(
+            text=remainder,
+            message_type=(
+                MessageType.COMMAND
+                if remainder.startswith("/")
+                else MessageType.TEXT
+            ),
+            source=source,
+            raw_message=dict(form),
+            message_id=source.message_id or "",
+        )
+        task = asyncio.create_task(dispatch_adapter.handle_message(event))
+        self._command_tasks.add(task)
+
+        def _log_dispatch_failure(done: asyncio.Task) -> None:
+            self._command_tasks.discard(done)
+            if done.cancelled():
+                return
+            try:
+                exc = done.exception()
+            except asyncio.CancelledError:
+                return
+            if exc is not None:
+                logger.error(
+                    "Mattermost /hermes dispatch failed: %s",
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+
+        task.add_done_callback(_log_dispatch_failure)
+        return web.json_response(
+            {
+                "response_type": "ephemeral",
+                "text": f"Routing to Hermes profile `{target_profile}`…",
+            }
+        )
 
 
     async def _resolve_root_id(self, post_id: str) -> str:
@@ -384,6 +708,60 @@ class MattermostAdapter(BasePlatformAdapter):
         if data and data.get("root_id"):
             return data["root_id"]
         return post_id
+
+    async def _get_thread_posts(self, root_id: str) -> List[Dict[str, Any]]:
+        """Return Mattermost thread posts in server order, failing closed."""
+        if not root_id:
+            return []
+        data = await self._api_get(f"posts/{root_id}/thread")
+        if not isinstance(data, dict):
+            return []
+        posts = data.get("posts")
+        order = data.get("order")
+        if not isinstance(posts, dict) or not isinstance(order, list):
+            return []
+        return [posts[post_id] for post_id in order if isinstance(posts.get(post_id), dict)]
+
+    def _thread_has_bot_context(
+        self,
+        posts: List[Dict[str, Any]],
+        current_post_id: str,
+    ) -> bool:
+        """Whether the bot was already addressed or participated in a thread."""
+        mention_patterns = (f"@{self._bot_username}", f"@{self._bot_user_id}")
+        for item in posts:
+            if item.get("id") == current_post_id:
+                continue
+            if item.get("user_id") == self._bot_user_id:
+                return True
+            text = str(item.get("message") or "").lower()
+            if any(pattern.lower() in text for pattern in mention_patterns):
+                return True
+        return False
+
+    def _format_thread_context(
+        self,
+        posts: List[Dict[str, Any]],
+        current_post_id: str,
+    ) -> Optional[str]:
+        """Format preceding Mattermost thread posts as untrusted channel context."""
+        prior = [item for item in posts if item.get("id") != current_post_id]
+        if not prior:
+            return None
+        lines: List[str] = []
+        for item in prior[-20:]:
+            text = str(item.get("message") or "").strip()
+            if not text:
+                continue
+            author = (
+                "bot"
+                if item.get("user_id") == self._bot_user_id
+                else str(item.get("user_id") or "participant")
+            )
+            lines.append(f"- {author}: {text}")
+        if not lines:
+            return None
+        return "Mattermost thread history before the current message:\n" + "\n".join(lines)
 
     async def send(
         self,
@@ -434,10 +812,15 @@ class MattermostAdapter(BasePlatformAdapter):
     async def send_typing(
         self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
     ) -> None:
-        """Send a typing indicator."""
+        """Send a typing indicator in the active channel or thread."""
+        payload = {"channel_id": chat_id}
+        if isinstance(metadata, dict):
+            thread_id = metadata.get("thread_id") or metadata.get("root_id")
+            if thread_id:
+                payload["parent_id"] = str(thread_id)
         await self._api_post(
             f"users/{self._bot_user_id}/typing",
-            {"channel_id": chat_id},
+            payload,
         )
 
     async def edit_message(
@@ -860,6 +1243,8 @@ class MattermostAdapter(BasePlatformAdapter):
 
         # For DMs, user_id is sufficient.  For channels, check for @mention.
         message_text = post.get("message", "")
+        incoming_thread_id = post.get("root_id") or None
+        thread_posts: Optional[List[Dict[str, Any]]] = None
 
         # Mention-gating for non-DM channels.
         # Config (config.yaml `mattermost.*` with env-var fallback):
@@ -909,7 +1294,12 @@ class MattermostAdapter(BasePlatformAdapter):
                 for pattern in mention_patterns
             )
 
-            if require_mention and not is_free_channel and not has_mention:
+            thread_continuation = False
+            if require_mention and not is_free_channel and not has_mention and incoming_thread_id:
+                thread_posts = await self._get_thread_posts(str(incoming_thread_id))
+                thread_continuation = self._thread_has_bot_context(thread_posts, post_id)
+
+            if require_mention and not is_free_channel and not has_mention and not thread_continuation:
                 logger.debug(
                     "Mattermost: skipping non-DM message without @mention (channel=%s)",
                     channel_id,
@@ -927,9 +1317,24 @@ class MattermostAdapter(BasePlatformAdapter):
         sender_id = post.get("user_id", "")
         sender_name = data.get("sender_name", "").lstrip("@") or sender_id
 
+        channel_context: Optional[str] = None
+        reply_to_message_id: Optional[str] = None
+        reply_to_text: Optional[str] = None
+        if incoming_thread_id:
+            if thread_posts is None:
+                thread_posts = await self._get_thread_posts(str(incoming_thread_id))
+            channel_context = self._format_thread_context(thread_posts, post_id)
+            root_post = next(
+                (item for item in thread_posts if item.get("id") == incoming_thread_id),
+                None,
+            )
+            if root_post:
+                reply_to_message_id = str(incoming_thread_id)
+                reply_to_text = str(root_post.get("message") or "") or None
+
         # Thread support: if the post is in a thread, use root_id. In
         # thread mode, top-level channel posts are valid roots for progress.
-        thread_id = post.get("root_id") or None
+        thread_id = incoming_thread_id
         if (
             not thread_id
             and self._reply_mode == "thread"
@@ -1018,6 +1423,9 @@ class MattermostAdapter(BasePlatformAdapter):
             media_urls=media_urls if media_urls else None,
             media_types=media_types if media_types else None,
             channel_prompt=_channel_prompt,
+            channel_context=channel_context,
+            reply_to_message_id=reply_to_message_id,
+            reply_to_text=reply_to_text,
         )
 
         await self.handle_message(msg_event)
@@ -1295,6 +1703,12 @@ def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
         if not _skip_env_bridge and not os.getenv("MATTERMOST_ALLOWED_CHANNELS"):
             _ac = ",".join(str(v) for v in ac) if isinstance(ac, list) else str(ac)
             os.environ["MATTERMOST_ALLOWED_CHANNELS"] = _ac
+    # Command listener bind settings are read from PlatformConfig.extra by
+    # the adapter constructor, so seed them there rather than via env.
+    for key in ("callback_host", "callback_port", "callback_url"):
+        value = mattermost_cfg.get(key)
+        if value not in (None, ""):
+            seeded[key] = value
     return seeded or None
 
 
