@@ -6,6 +6,7 @@ turn counting, tags), and schema completeness.
 """
 
 import json
+import logging
 import os
 import re
 import stat
@@ -444,7 +445,8 @@ class TestPostSetup:
 
 
 class TestToolHandlers:
-    def test_retain_success(self, provider):
+    def test_retain_success(self, provider_with_config):
+        provider = provider_with_config(retain_async=False)
         result = json.loads(provider.handle_tool_call(
             "hindsight_retain", {"content": "user likes dark mode"}
         ))
@@ -458,7 +460,8 @@ class TestToolHandlers:
         assert "bank_id" not in item
         assert "retain_async" not in item
 
-    def test_retain_defaults_item_timestamp_when_no_occurred_at(self, provider, monkeypatch):
+    def test_retain_defaults_item_timestamp_when_no_occurred_at(self, provider_with_config, monkeypatch):
+        provider = provider_with_config(retain_async=False)
         event_time = datetime(2026, 8, 24, 9, 30, tzinfo=ZoneInfo("America/Los_Angeles"))
         monkeypatch.setattr("plugins.memory.hindsight._hermes_now", lambda: event_time)
         result = json.loads(provider.handle_tool_call(
@@ -470,7 +473,8 @@ class TestToolHandlers:
         # server can resolve any relative time phrases (#93568).
         assert item["timestamp"] == event_time.isoformat(timespec="seconds")
 
-    def test_retain_threads_explicit_occurred_at_into_item_timestamp(self, provider):
+    def test_retain_threads_explicit_occurred_at_into_item_timestamp(self, provider_with_config):
+        provider = provider_with_config(retain_async=False)
         result = json.loads(provider.handle_tool_call(
             "hindsight_retain",
             {"content": "user visited Paris", "occurred_at": "2026-03-03"},
@@ -479,7 +483,8 @@ class TestToolHandlers:
         item = provider._client.aretain_batch.call_args.kwargs["items"][0]
         assert item["timestamp"] == "2026-03-03"
 
-    def test_retain_ignores_blank_occurred_at(self, provider, monkeypatch):
+    def test_retain_ignores_blank_occurred_at(self, provider_with_config, monkeypatch):
+        provider = provider_with_config(retain_async=False)
         event_time = datetime(2026, 8, 24, 9, 30, tzinfo=ZoneInfo("America/Los_Angeles"))
         monkeypatch.setattr("plugins.memory.hindsight._hermes_now", lambda: event_time)
         json.loads(provider.handle_tool_call(
@@ -491,6 +496,98 @@ class TestToolHandlers:
     def test_build_retain_kwargs_accepts_explicit_occurred_at(self, provider):
         item = provider._build_retain_kwargs("dinner with Sam", occurred_at="2026-08-20T19:00:00+02:00")
         assert item["timestamp"] == "2026-08-20T19:00:00+02:00"
+
+    # -- retain_async handling for the explicit tool (#61442, #64326) --------
+
+    def test_retain_tool_passes_configured_retain_async_flag_sync(self, provider_with_config):
+        p = provider_with_config(retain_async=False)
+        p.handle_tool_call("hindsight_retain", {"content": "store synchronously"})
+        call_kwargs = p._client.aretain_batch.call_args.kwargs
+        assert call_kwargs["retain_async"] is False
+        assert "retain_async" not in call_kwargs["items"][0]
+
+    def test_retain_tool_async_queues_on_writer_and_returns_immediately(self, provider):
+        """Default config (retain_async=True) must not block the tool call on
+        server-side extraction — the same path sync_turn already uses."""
+        release = threading.Event()
+        started = threading.Event()
+
+        async def _slow_retain(**kwargs):
+            started.set()
+            release.wait(timeout=5.0)
+            return SimpleNamespace(operation_id="op-tool-1", operation_ids=None)
+
+        provider._client.aretain_batch = AsyncMock(side_effect=_slow_retain)
+
+        t0 = time.monotonic()
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_retain", {"content": "user likes dark mode"}
+        ))
+        elapsed = time.monotonic() - t0
+
+        # Returned without waiting for the (blocked) server call.
+        assert elapsed < 1.0
+        assert result["result"] == "Memory queued for storage."
+        assert "error" not in result
+
+        release.set()
+        provider._retain_queue.join()
+
+        provider._client.aretain_batch.assert_called_once()
+        call_kwargs = provider._client.aretain_batch.call_args.kwargs
+        assert call_kwargs["bank_id"] == "test-bank"
+        assert call_kwargs["retain_async"] is True
+        item = call_kwargs["items"][0]
+        assert item["content"] == "user likes dark mode"
+        assert "bank_id" not in item
+        assert "retain_async" not in item
+        # The async op id is tracked so the next-turn prefetch can wait on it.
+        assert "op-tool-1" in provider._pending_retain_ops
+
+    def test_retain_tool_async_preserves_tags_and_occurred_at(self, provider_with_config):
+        p = provider_with_config(retain_tags=["pref"])
+        p.handle_tool_call(
+            "hindsight_retain",
+            {"content": "visited Paris", "tags": ["trip"], "occurred_at": "2026-03-03"},
+        )
+        p._retain_queue.join()
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        assert item["tags"] == ["pref", "trip"]
+        assert item["timestamp"] == "2026-03-03"
+
+    def test_retain_tool_async_failure_logged_not_raised(self, provider, caplog):
+        provider._client.aretain_batch.side_effect = RuntimeError("connection failed")
+        with caplog.at_level(logging.WARNING, logger="plugins.memory.hindsight"):
+            result = json.loads(provider.handle_tool_call(
+                "hindsight_retain", {"content": "test"}
+            ))
+            provider._retain_queue.join()
+        # Queued path: the tool call itself succeeded; the failure surfaces in logs.
+        assert result["result"] == "Memory queued for storage."
+        assert any("connection failed" in r.getMessage() for r in caplog.records)
+
+    def test_retain_tool_async_serialises_behind_pending_sync_turn(self, provider):
+        """Tool retains ride the same FIFO writer as auto-retain so a tool call
+        can't race a pending turn retain against the same document."""
+        order = []
+
+        async def _record(**kwargs):
+            content = kwargs["items"][0]["content"]
+            order.append("turn" if content.startswith("[") else content[:6])
+            return SimpleNamespace(operation_id=None, operation_ids=None)
+
+        provider._client.aretain_batch = AsyncMock(side_effect=_record)
+        provider.sync_turn("turn-1 user", "turn-1 assistant")
+        provider.handle_tool_call("hindsight_retain", {"content": "tool-1 fact"})
+        provider._retain_queue.join()
+        assert order == ["turn", "tool-1"]
+
+    def test_retain_tool_sync_failure_returns_error(self, provider_with_config):
+        p = provider_with_config(retain_async=False)
+        p._client.aretain_batch.side_effect = RuntimeError("connection failed")
+        result = json.loads(p.handle_tool_call("hindsight_retain", {"content": "test"}))
+        assert "error" in result
+        assert "connection failed" in result["error"]
 
     def test_retain_schema_exposes_occurred_at(self):
         from plugins.memory.hindsight import RETAIN_SCHEMA
